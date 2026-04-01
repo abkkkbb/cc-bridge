@@ -20,6 +20,7 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=backend /app/cc2api .
+COPY --from=frontend /app/web/dist ./web/dist
 RUN mkdir -p data
 EXPOSE 8080
 CMD ["./cc2api"]

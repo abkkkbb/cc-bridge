@@ -6,8 +6,10 @@
 package tlsfp
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -72,7 +74,7 @@ func buildSpec() *utls.ClientHelloSpec {
 			&utls.SupportedCurvesExtension{Curves: curves},
 			&utls.SupportedPointsExtension{SupportedPoints: []byte{0}}, // uncompressed
 			&utls.SessionTicketExtension{},
-			&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+			&utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}},
 			&utls.StatusRequestExtension{},
 			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: sigAlgs},
 			&utls.SCTExtension{},
@@ -175,30 +177,34 @@ func NewTransport(proxyURL string) *http.Transport {
 				return nil, fmt.Errorf("proxy dial: %w", err)
 			}
 
-			// Send CONNECT
-			connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
-			if parsed.User != nil {
-				// Basic auth not implemented for simplicity; add if needed
-				connectReq += "\r\n"
-			} else {
-				connectReq += "\r\n"
+			// Send CONNECT request using standard library
+			connectReq := &http.Request{
+				Method: "CONNECT",
+				URL:    &url.URL{Opaque: addr},
+				Host:   addr,
+				Header: make(http.Header),
 			}
-			if _, err := proxyConn.Write([]byte(connectReq)); err != nil {
+			if parsed.User != nil {
+				username := parsed.User.Username()
+				password, _ := parsed.User.Password()
+				creds := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+				connectReq.Header.Set("Proxy-Authorization", "Basic "+creds)
+			}
+			if err := connectReq.Write(proxyConn); err != nil {
 				proxyConn.Close()
 				return nil, fmt.Errorf("proxy CONNECT write: %w", err)
 			}
 
-			// Read response (simple parse)
-			buf := make([]byte, 4096)
-			n, err := proxyConn.Read(buf)
+			// Read CONNECT response using standard library
+			br := bufio.NewReader(proxyConn)
+			resp, err := http.ReadResponse(br, connectReq)
 			if err != nil {
 				proxyConn.Close()
 				return nil, fmt.Errorf("proxy CONNECT read: %w", err)
 			}
-			resp := string(buf[:n])
-			if len(resp) < 12 || resp[9] != '2' {
+			if resp.StatusCode != http.StatusOK {
 				proxyConn.Close()
-				return nil, fmt.Errorf("proxy CONNECT failed: %s", resp[:min(len(resp), 80)])
+				return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
 			}
 
 			return dialTLS(proxyConn, hostFromAddr(addr))
