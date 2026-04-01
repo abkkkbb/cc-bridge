@@ -1,0 +1,12 @@
+config.json
+cc2api
+cc2api.exe
+web/node_modules/
+web/dist/
+.env
+data/*.db
+data/*.db-shm
+data/*.db-wal
+*.db
+*.db-shm
+*.db-wal
