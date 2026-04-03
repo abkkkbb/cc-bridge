@@ -161,6 +161,15 @@ pub struct Account {
     pub canonical_prompt: Value,
     pub canonical_process: Value,
     pub billing_mode: BillingMode,
+    /// OAuth account UUID（强烈推荐填写，用于遥测改写）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uuid: Option<String>,
+    /// OAuth organization UUID（强烈推荐填写，用于遥测改写）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_uuid: Option<String>,
+    /// 订阅类型：max / pro / team / enterprise（强烈推荐填写，用于遥测改写）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
     #[serde(default = "default_concurrency")]
     pub concurrency: i32,
     #[serde(default = "default_priority")]

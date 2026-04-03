@@ -228,6 +228,11 @@ impl GatewayService {
         );
 
         for (k, v) in resp.headers() {
+            let name = k.as_str();
+            // 过滤已知 AI Gateway / 代理指纹响应头，防止客户端检测并上报
+            if is_gateway_fingerprint_header(name) {
+                continue;
+            }
             response_builder = response_builder.header(k.clone(), v.clone());
         }
 
@@ -295,6 +300,18 @@ fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, Str
         }
     }
     map
+}
+
+/// Claude Code 主动扫描响应头检测 AI Gateway/代理（src/services/api/logging.ts）。
+/// 过滤这些指纹前缀以防止客户端上报 gateway 类型。
+/// Claude Code 扫描的 AI Gateway 响应头前缀（来源: src/services/api/logging.ts）。
+const GATEWAY_HEADER_PREFIXES: &[&str] = &[
+    "x-litellm-", "helicone-", "x-portkey-", "cf-aig-", "x-kong-", "x-bt-",
+];
+
+fn is_gateway_fingerprint_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    GATEWAY_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
 fn truncate_body(b: &[u8], max: usize) -> String {

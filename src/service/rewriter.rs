@@ -140,12 +140,16 @@ impl Rewriter {
                 "accept-encoding".into(),
                 "gzip, deflate, br, zstd".into(),
             );
+            let stainless_os = stainless_os_from_platform(&env.platform);
             out.insert("X-Stainless-Lang".into(), "js".into());
             out.insert("X-Stainless-Package-Version".into(), "0.70.0".into());
-            out.insert("X-Stainless-OS".into(), "Linux".into());
-            out.insert("X-Stainless-Arch".into(), "arm64".into());
+            out.insert("X-Stainless-OS".into(), stainless_os.into());
+            out.insert("X-Stainless-Arch".into(), env.arch.clone());
             out.insert("X-Stainless-Runtime".into(), "node".into());
-            out.insert("X-Stainless-Runtime-Version".into(), "v24.13.0".into());
+            out.insert(
+                "X-Stainless-Runtime-Version".into(),
+                env.node_version.clone(),
+            );
             out.insert("X-Stainless-Retry-Count".into(), "0".into());
             out.insert("X-Stainless-Timeout".into(), "600".into());
 
@@ -180,6 +184,7 @@ impl Rewriter {
             .into_iter()
             .collect();
 
+            let stainless_os = stainless_os_from_platform(&env.platform);
             for (k, v) in headers {
                 let lower = k.to_lowercase();
                 if !allowed.contains(lower.as_str()) {
@@ -192,6 +197,15 @@ impl Rewriter {
                             wire_key,
                             format!("claude-code/{} (external, cli)", version),
                         );
+                    }
+                    "x-stainless-os" => {
+                        out.insert(wire_key, stainless_os.to_string());
+                    }
+                    "x-stainless-arch" => {
+                        out.insert(wire_key, env.arch.clone());
+                    }
+                    "x-stainless-runtime-version" => {
+                        out.insert(wire_key, env.node_version.clone());
                     }
                     _ => {
                         out.insert(wire_key, v.clone());
@@ -241,11 +255,20 @@ impl Rewriter {
             self.rewrite_messages(&mut parsed, account, client_type);
         } else if path.contains("/event_logging/batch") {
             self.rewrite_event_batch(&mut parsed, account);
+        } else if path.starts_with("/api/eval/") {
+            self.rewrite_growthbook_eval(&mut parsed, account);
         } else {
             self.rewrite_generic_identity(&mut parsed, account);
         }
 
-        serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec())
+        let mut output = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
+
+        // Rewrite 模式下对 /v1/messages 请求计算 cch attestation
+        if path.starts_with("/v1/messages") && account.billing_mode == BillingMode::Rewrite {
+            output = compute_cch_attestation(output);
+        }
+
+        output
     }
 
     /// 处理 /v1/messages 请求体。
@@ -262,6 +285,7 @@ impl Rewriter {
             // 替换模式
             self.rewrite_metadata_user_id(body, account);
             self.rewrite_system_prompt(body, &prompt_env, &env.version, &account.billing_mode);
+            scrub_git_user_in_reminders(body, &account.name);
         } else {
             // 注入模式
             let session_id = self.inject_metadata_user_id(body, account);
@@ -377,7 +401,8 @@ impl Rewriter {
         }
 
         let session_id = generate_session_uuid();
-        let account_uuid = derive_account_uuid(account);
+        let account_uuid = account.account_uuid.clone()
+            .unwrap_or_else(|| derive_account_uuid(account));
         let uid = serde_json::json!({
             "device_id": account.device_id,
             "account_uuid": account_uuid,
@@ -468,8 +493,12 @@ impl Rewriter {
         let rewrite = |text: &str| -> String {
             let mut text = text.to_string();
             if *billing_mode == BillingMode::Rewrite {
-                text = BILLING_REGEX
+                text = BILLING_VERSION_REGEX
                     .replace_all(&text, &format!("cc_version={}.{}", version, cch_hash))
+                    .to_string();
+                // 将已有的 cch 值重置为占位符，后续在序列化后通过 xxhash64 重新计算
+                text = CCH_VALUE_REGEX
+                    .replace_all(&text, "cch=00000")
                     .to_string();
             } else {
                 text = BILLING_LINE_REGEX.replace_all(&text, "").to_string();
@@ -597,6 +626,20 @@ impl Rewriter {
             e.remove("base_url");
             e.remove("gateway");
 
+            // 改写 account_uuid / organization_uuid
+            if e.contains_key("account_uuid") {
+                let uuid = account.account_uuid.clone()
+                    .unwrap_or_else(|| derive_account_uuid(account));
+                e.insert("account_uuid".into(), serde_json::Value::String(uuid));
+            }
+            if e.contains_key("organization_uuid") {
+                if let Some(ref org) = account.organization_uuid {
+                    e.insert("organization_uuid".into(), serde_json::Value::String(org.clone()));
+                } else {
+                    e.remove("organization_uuid");
+                }
+            }
+
             if e.contains_key("env") {
                 e.insert("env".into(), canonical_env.clone());
             }
@@ -612,6 +655,55 @@ impl Rewriter {
                     serde_json::Value::String(rewritten),
                 );
             }
+
+            // 改写 user_attributes（GrowthBook 实验事件中的 JSON 字符串）
+            if let Some(ua_str) = e.get("user_attributes").and_then(|v| v.as_str()) {
+                let rewritten = rewrite_user_attributes_json(ua_str, account);
+                e.insert(
+                    "user_attributes".into(),
+                    serde_json::Value::String(rewritten),
+                );
+            }
+        }
+    }
+
+    // --- GrowthBook remoteEval 改写 (POST /api/eval/{clientKey}) ---
+
+    fn rewrite_growthbook_eval(&self, body: &mut serde_json::Value, account: &Account) {
+        let env = self.parse_env(account);
+        let attrs = match body.get_mut("attributes").and_then(|a| a.as_object_mut()) {
+            Some(a) => a,
+            None => return,
+        };
+
+        // 身份字段
+        attrs.insert("id".into(), serde_json::Value::String(account.device_id.clone()));
+        attrs.insert("deviceID".into(), serde_json::Value::String(account.device_id.clone()));
+
+        if attrs.contains_key("email") {
+            attrs.insert("email".into(), serde_json::Value::String(account.email.clone()));
+        }
+        if attrs.contains_key("accountUUID") {
+            let uuid = account.account_uuid.clone()
+                .unwrap_or_else(|| derive_account_uuid(account));
+            attrs.insert("accountUUID".into(), serde_json::Value::String(uuid));
+        }
+        if let Some(ref org) = account.organization_uuid {
+            attrs.insert("organizationUUID".into(), serde_json::Value::String(org.clone()));
+        } else {
+            attrs.remove("organizationUUID");
+        }
+        if let Some(ref sub) = account.subscription_type {
+            attrs.insert("subscriptionType".into(), serde_json::Value::String(sub.clone()));
+        }
+
+        // 移除代理暴露字段
+        attrs.remove("apiBaseUrlHost");
+
+        // 环境对齐
+        attrs.insert("platform".into(), serde_json::Value::String(env.platform.clone()));
+        if attrs.contains_key("appVersion") {
+            attrs.insert("appVersion".into(), serde_json::Value::String(env.version.clone()));
         }
     }
 
@@ -665,10 +757,37 @@ static BILLING_LINE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^\s*x-anthropic-billing-header:[^\n]*\n?").unwrap());
 static BILLING_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3};[^;]*;?").unwrap());
+/// 仅匹配 cc_version 值部分，用于 Rewrite 模式保留 cc_entrypoint。
+static BILLING_VERSION_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"cc_version=[\d.]+\.[a-f0-9]{3}").unwrap());
+static CCH_VALUE_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"cch=[a-f0-9]{5}").unwrap());
+static GIT_USER_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"Git user:\s*[^\n]+").unwrap());
 static SYSTEM_REMINDER_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<system-reminder>(.*?)</system-reminder>").unwrap());
 
-// --- CCH hash ---
+// --- CCH Attestation (xxhash64) ---
+
+const CCH_ATTESTATION_SEED: u64 = 0x6E52736AC806831E;
+const CCH_PLACEHOLDER: &[u8] = b"cch=00000";
+
+/// 对序列化后的 body 字节计算 cch attestation 并原地替换占位符。
+/// 算法：xxhash64(body_with_placeholder, seed) 取低 20 bits → 5 位十六进制。
+fn compute_cch_attestation(mut body: Vec<u8>) -> Vec<u8> {
+    if let Some(pos) = body
+        .windows(CCH_PLACEHOLDER.len())
+        .position(|w| w == CCH_PLACEHOLDER)
+    {
+        let hash = xxhash_rust::xxh64::xxh64(&body, CCH_ATTESTATION_SEED);
+        let cch = format!("{:05x}", hash & 0xFFFFF);
+        // "cch=" 占 4 字节，后续 5 字节是 "00000"
+        body[pos + 4..pos + 9].copy_from_slice(cch.as_bytes());
+    }
+    body
+}
+
+// --- CCH fingerprint (SHA256) ---
 
 const CCH_SALT: &str = "59cf53e54c78";
 const CCH_POSITIONS: [usize; 3] = [4, 7, 20];
@@ -850,6 +969,40 @@ fn rewrite_additional_metadata(encoded: &str) -> String {
     engine.encode(&out)
 }
 
+/// 改写 GrowthBook 实验事件中 user_attributes JSON 字符串内的身份字段。
+fn rewrite_user_attributes_json(json_str: &str, account: &Account) -> String {
+    let mut obj: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return json_str.to_string(),
+    };
+    if let Some(map) = obj.as_object_mut() {
+        if map.contains_key("id") {
+            map.insert("id".into(), serde_json::Value::String(account.device_id.clone()));
+        }
+        if map.contains_key("deviceID") {
+            map.insert("deviceID".into(), serde_json::Value::String(account.device_id.clone()));
+        }
+        if map.contains_key("email") {
+            map.insert("email".into(), serde_json::Value::String(account.email.clone()));
+        }
+        if map.contains_key("accountUUID") {
+            let uuid = account.account_uuid.clone()
+                .unwrap_or_else(|| derive_account_uuid(account));
+            map.insert("accountUUID".into(), serde_json::Value::String(uuid));
+        }
+        if let Some(ref org) = account.organization_uuid {
+            map.insert("organizationUUID".into(), serde_json::Value::String(org.clone()));
+        } else {
+            map.remove("organizationUUID");
+        }
+        if let Some(ref sub) = account.subscription_type {
+            map.insert("subscriptionType".into(), serde_json::Value::String(sub.clone()));
+        }
+        map.remove("apiBaseUrlHost");
+    }
+    serde_json::to_string(&obj).unwrap_or_else(|_| json_str.to_string())
+}
+
 /// 移除 system 和消息内容块中的 cache_control。
 fn strip_cache_control(body: &mut serde_json::Value) {
     if let Some(sys) = body.get_mut("system").and_then(|s| s.as_array_mut()) {
@@ -928,7 +1081,8 @@ pub fn clean_session_id_from_body(body: &mut serde_json::Value) {
 
 /// 判断请求来自 Claude Code 还是纯 API。
 pub fn detect_client_type(user_agent: &str, body: &serde_json::Value) -> ClientType {
-    if user_agent.to_lowercase().starts_with("claude-cli/") {
+    let ua_lower = user_agent.to_lowercase();
+    if ua_lower.starts_with("claude-code/") || ua_lower.starts_with("claude-cli/") {
         return ClientType::ClaudeCode;
     }
     if let Some(metadata) = body.get("metadata").and_then(|m| m.as_object()) {
@@ -980,6 +1134,47 @@ fn random_in_range(min: i64, max: i64) -> i64 {
         return min;
     }
     rand::thread_rng().gen_range(min..max)
+}
+
+/// 仅在 `<system-reminder>` 标签内替换 `Git user:` 行。
+/// 不影响 messages、tools 和 `<system-reminder>` 外部的文本，避免破坏 git 操作。
+fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &str) {
+    let replacement = format!("Git user: {}", replacement_name);
+    let scrub = |text: &str| -> String {
+        SYSTEM_REMINDER_REGEX
+            .replace_all(text, |caps: &regex::Captures| {
+                GIT_USER_REGEX.replace_all(&caps[0], replacement.as_str()).to_string()
+            })
+            .to_string()
+    };
+
+    if let Some(system) = body.get_mut("system") {
+        match system {
+            serde_json::Value::String(s) => {
+                *s = scrub(s);
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        let new_text = scrub(text);
+                        item.as_object_mut()
+                            .unwrap()
+                            .insert("text".into(), serde_json::Value::String(new_text));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 将 canonical env 的 platform 映射为 X-Stainless-OS 值。
+fn stainless_os_from_platform(platform: &str) -> &str {
+    match platform {
+        "darwin" => "Mac OS X",
+        "win32" => "Windows",
+        _ => "Linux",
+    }
 }
 
 fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {

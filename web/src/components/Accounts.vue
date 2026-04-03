@@ -41,6 +41,9 @@ const form = ref({
   expires_at: '',
   proxy_url: '',
   billing_mode: 'strip',
+  account_uuid: '',
+  organization_uuid: '',
+  subscription_type: '',
   concurrency: 3,
   priority: 50,
 });
@@ -97,6 +100,9 @@ function openCreate() {
     expires_at: '',
     proxy_url: '',
     billing_mode: 'strip',
+    account_uuid: '',
+    organization_uuid: '',
+    subscription_type: '',
     concurrency: 3,
     priority: 50,
   };
@@ -119,6 +125,9 @@ function openEdit(a: Account) {
     expires_at: a.expires_at ? String(a.expires_at) : '',
     proxy_url: a.proxy_url,
     billing_mode: a.billing_mode || 'strip',
+    account_uuid: a.account_uuid || '',
+    organization_uuid: a.organization_uuid || '',
+    subscription_type: a.subscription_type || '',
     concurrency: a.concurrency,
     priority: a.priority,
   };
@@ -150,6 +159,9 @@ async function save() {
       if (expiresAt) updates.expires_at = Number(expiresAt);
       updates.proxy_url = form.value.proxy_url;
       updates.billing_mode = form.value.billing_mode;
+      updates.account_uuid = form.value.account_uuid || null;
+      updates.organization_uuid = form.value.organization_uuid || null;
+      updates.subscription_type = form.value.subscription_type || null;
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       await api.updateAccount(editing.value.id, updates);
@@ -169,6 +181,9 @@ async function save() {
         refresh_token: form.value.refresh_token,
         proxy_url: form.value.proxy_url,
         billing_mode: form.value.billing_mode,
+        account_uuid: form.value.account_uuid || null,
+        organization_uuid: form.value.organization_uuid || null,
+        subscription_type: form.value.subscription_type || null,
         concurrency: form.value.concurrency,
         priority: form.value.priority,
       };
@@ -560,15 +575,15 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
 
     <!-- 新建/编辑账号弹窗 -->
     <Dialog v-model:open="showForm">
-      <DialogContent class="bg-white border-[#e8e2d9] rounded-2xl text-[#29261e] sm:max-w-md">
-        <DialogHeader>
+      <DialogContent class="bg-white border-[#e8e2d9] rounded-2xl text-[#29261e] sm:max-w-md max-h-[85vh] flex flex-col">
+        <DialogHeader class="flex-shrink-0">
           <DialogTitle class="text-[#29261e] text-lg">{{ editing ? '编辑账号' : '添加账号' }}</DialogTitle>
           <DialogDescription class="text-[#8c8475]">
             {{ editing ? '修改账号信息，凭证留空表示不更改' : '填写新账号信息' }}
           </DialogDescription>
         </DialogHeader>
 
-        <form @submit.prevent="save" class="space-y-4 mt-2">
+        <form @submit.prevent="save" class="space-y-4 mt-2 overflow-y-auto flex-1 pr-1">
           <div class="space-y-2">
             <Label class="text-[#5c5647] text-sm">备注名（选填）</Label>
             <Input
@@ -690,6 +705,48 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
               >
                 重写 (Rewrite)
               </button>
+            </div>
+          </div>
+          <!-- 遥测身份（选填） -->
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">订阅类型（选填，强烈推荐）</Label>
+            <div class="flex gap-2 flex-wrap">
+              <button
+                v-for="opt in [
+                  { value: '', label: '未设置' },
+                  { value: 'max', label: 'Max' },
+                  { value: 'pro', label: 'Pro' },
+                  { value: 'team', label: 'Team' },
+                  { value: 'enterprise', label: 'Enterprise' },
+                ]"
+                :key="opt.value"
+                type="button"
+                @click="form.subscription_type = opt.value"
+                class="px-3 py-1.5 rounded-lg text-xs font-medium border transition-all duration-200"
+                :class="form.subscription_type === opt.value
+                  ? 'bg-[#c4704f]/10 border-[#c4704f] text-[#c4704f]'
+                  : 'bg-[#f9f6f1] border-[#e8e2d9] text-[#8c8475] hover:border-[#c4704f]/40'"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+          </div>
+          <div class="flex gap-4">
+            <div class="flex-1 space-y-2">
+              <Label class="text-[#5c5647] text-sm">Account UUID（选填）</Label>
+              <Input
+                v-model="form.account_uuid"
+                placeholder="OAuth account UUID"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
+            </div>
+            <div class="flex-1 space-y-2">
+              <Label class="text-[#5c5647] text-sm">Organization UUID（选填）</Label>
+              <Input
+                v-model="form.organization_uuid"
+                placeholder="OAuth organization UUID"
+                class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
+              />
             </div>
           </div>
           <div class="flex gap-4">

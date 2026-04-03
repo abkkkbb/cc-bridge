@@ -37,6 +37,9 @@ export interface Account {
   proxy_url: string
   device_id: string
   billing_mode: string
+  account_uuid?: string | null
+  organization_uuid?: string | null
+  subscription_type?: string | null
   concurrency: number
   priority: number
   rate_limited_at?: string

@@ -34,6 +34,7 @@ redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
 # Crypto
 sha2 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 rand = "0.8"
 hex = "0.4"
 base64 = "0.22"
