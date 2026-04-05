@@ -2,12 +2,12 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::error::AppError;
-use crate::model::account::Account;
+use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::account::AccountService;
 use crate::service::rewriter::{
@@ -216,9 +216,54 @@ impl GatewayService {
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
 
-        // 处理限速
+        // 处理限速：429 自动停用 5 小时
         if status_code == 429 {
-            self.handle_rate_limit(resp.headers(), account).await;
+            let reset_at = Utc::now() + chrono::Duration::hours(5);
+            if let Err(e) = self
+                .account_svc
+                .disable_account(
+                    account.id,
+                    AccountStatus::Active,
+                    "429 速率限制",
+                    Some(reset_at),
+                )
+                .await
+            {
+                warn!("failed to disable account {} for 429: {}", account.id, e);
+            } else {
+                warn!(
+                    "account {} rate limited for 5h until {}",
+                    account.id,
+                    reset_at.to_rfc3339()
+                );
+            }
+        }
+
+        // 处理认证失败：403 永久停用（但如果账号已处于 429 限流中则跳过，避免误判）
+        if status_code == 403 {
+            let is_rate_limited = account
+                .rate_limit_reset_at
+                .map(|reset| Utc::now() < reset)
+                .unwrap_or(false);
+            if is_rate_limited {
+                warn!(
+                    "account {} got 403 while rate-limited, skipping permanent disable",
+                    account.id
+                );
+            } else if let Err(e) = self
+                .account_svc
+                .disable_account(
+                    account.id,
+                    AccountStatus::Disabled,
+                    "403 认证失败",
+                    None,
+                )
+                .await
+            {
+                warn!("failed to disable account {} for 403: {}", account.id, e);
+            } else {
+                warn!("account {} permanently disabled for 403", account.id);
+            }
         }
 
         // 构建响应
@@ -245,51 +290,6 @@ impl GatewayService {
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))
     }
 
-    async fn handle_rate_limit(&self, headers: &reqwest::header::HeaderMap, account: &Account) {
-        let retry_after = headers
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let rate_limit_reset = headers
-            .get("anthropic-ratelimit-requests-reset")
-            .or_else(|| headers.get("anthropic-ratelimit-tokens-reset"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        if let Some(retry) = retry_after {
-            if let Ok(secs) = retry.parse::<u64>() {
-                let reset_at = Utc::now() + chrono::Duration::seconds(secs as i64);
-                let _ = self
-                    .account_svc
-                    .set_rate_limit(account.id, reset_at)
-                    .await;
-                warn!(
-                    "account {} rate limited until {} (Retry-After)",
-                    account.id,
-                    reset_at.to_rfc3339()
-                );
-            }
-        } else if let Some(reset_str) = rate_limit_reset {
-            if let Ok(reset_at) = DateTime::parse_from_rfc3339(&reset_str) {
-                let reset_at = reset_at.with_timezone(&Utc);
-                let _ = self
-                    .account_svc
-                    .set_rate_limit(account.id, reset_at)
-                    .await;
-                warn!(
-                    "account {} rate limited until {} (anthropic-ratelimit)",
-                    account.id,
-                    reset_at.to_rfc3339()
-                );
-            }
-        } else {
-            warn!(
-                "account {} got 429 without reset headers, not marking rate limited",
-                account.id
-            );
-        }
-    }
 }
 
 fn extract_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {

@@ -44,6 +44,7 @@ export interface Account {
   priority: number
   rate_limited_at?: string
   rate_limit_reset_at?: string
+  disable_reason?: string
   usage_data?: UsageData
   usage_fetched_at?: string
   created_at: string

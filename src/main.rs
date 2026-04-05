@@ -1,13 +1,7 @@
-#![allow(dead_code)]
-
-mod config;
-mod error;
-mod handler;
-mod middleware;
-mod model;
-mod service;
-mod store;
-mod tlsfp;
+use claude_code_gateway::config;
+use claude_code_gateway::handler;
+use claude_code_gateway::service;
+use claude_code_gateway::store;
 
 use std::sync::Arc;
 use tracing::info;

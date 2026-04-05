@@ -193,6 +193,7 @@ async fn create_account(
         priority: req.priority.unwrap_or(50),
         rate_limited_at: None,
         rate_limit_reset_at: None,
+        disable_reason: String::new(),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         created_at: chrono::Utc::now(),
@@ -267,7 +268,25 @@ async fn update_account(
     }
     if let Some(status) = updates.get("status").and_then(|v| v.as_str()) {
         if !status.is_empty() {
-            existing.status = status.to_string().into();
+            if status == "active" {
+                state.account_svc.enable_account(id).await?;
+                existing = state.account_svc.get_account(id).await?;
+                return Ok(Json(existing));
+            } else if status == "disabled" {
+                state
+                    .account_svc
+                    .disable_account(
+                        id,
+                        AccountStatus::Disabled,
+                        "手动停用",
+                        None,
+                    )
+                    .await?;
+                existing = state.account_svc.get_account(id).await?;
+                return Ok(Json(existing));
+            } else {
+                existing.status = status.to_string().into();
+            }
         }
     }
     if let Some(billing_mode) = updates.get("billing_mode").and_then(|v| v.as_str()) {

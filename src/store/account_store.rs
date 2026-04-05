@@ -95,6 +95,7 @@ impl AccountStore {
             priority: row.try_get::<i32, _>("priority").unwrap_or(50),
             rate_limited_at: Self::parse_optional_time(row, "rate_limited_at"),
             rate_limit_reset_at: Self::parse_optional_time(row, "rate_limit_reset_at"),
+            disable_reason: row.try_get::<String, _>("disable_reason").unwrap_or_default(),
             usage_data: Self::parse_json(row, "usage_data"),
             usage_fetched_at: Self::parse_optional_time(row, "usage_fetched_at"),
             created_at: Self::parse_time(row, "created_at"),
@@ -273,6 +274,43 @@ impl AccountStore {
         Ok(())
     }
 
+    pub async fn disable_account(
+        &self,
+        id: i64,
+        status: AccountStatus,
+        reason: &str,
+        rate_limit_reset_at: Option<DateTime<Utc>>,
+    ) -> Result<(), AppError> {
+        let q = format!(
+            r#"UPDATE accounts SET status=$1, disable_reason=$2,
+                rate_limited_at=$3, rate_limit_reset_at=$4, updated_at={}
+            WHERE id=$5"#,
+            self.now_expr()
+        );
+        let limited_str = rate_limit_reset_at.map(|_| self.fmt_time(Utc::now()));
+        let reset_str = rate_limit_reset_at.map(|t| self.fmt_time(t));
+        sqlx::query(&q)
+            .bind(status.to_string())
+            .bind(reason)
+            .bind(limited_str)
+            .bind(reset_str)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
+        let q = format!(
+            r#"UPDATE accounts SET status='active', disable_reason='',
+                rate_limited_at=NULL, rate_limit_reset_at=NULL, updated_at={}
+            WHERE id=$1"#,
+            self.now_expr()
+        );
+        sqlx::query(&q).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn clear_rate_limit(&self, id: i64) -> Result<(), AppError> {
         let q = format!(
             "UPDATE accounts SET rate_limited_at=NULL, rate_limit_reset_at=NULL, updated_at={} WHERE id=$1",
@@ -370,4 +408,4 @@ const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rate_limited_at, rate_limit_reset_at,
-    usage_data, usage_fetched_at, created_at, updated_at"#;
+    disable_reason, usage_data, usage_fetched_at, created_at, updated_at"#;

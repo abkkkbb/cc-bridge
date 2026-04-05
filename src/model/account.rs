@@ -179,6 +179,8 @@ pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_reset_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub disable_reason: String,
+    #[serde(default)]
     pub usage_data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_fetched_at: Option<DateTime<Utc>>,

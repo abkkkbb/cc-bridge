@@ -268,9 +268,13 @@ async function refreshUsage(id: number) {
  */
 async function toggleScheduling(a: Account) {
   try {
-    const newStatus = a.status === 'disabled' ? 'active' : 'disabled';
-    await api.updateAccount(a.id, { status: newStatus });
-    a.status = newStatus;
+    const isStopped = a.status === 'disabled' || isRateLimited(a);
+    const newStatus = isStopped ? 'active' : 'disabled';
+    const res = await api.updateAccount(a.id, { status: newStatus });
+    a.status = res.status;
+    a.disable_reason = res.disable_reason ?? '';
+    a.rate_limited_at = res.rate_limited_at;
+    a.rate_limit_reset_at = res.rate_limit_reset_at;
     emit('refresh');
   } catch (e: unknown) {
     toast((e as Error).message || '切换调度失败');
@@ -301,12 +305,21 @@ function usageBarColor(pct: number): string {
 }
 
 /**
- * 获取状态徽章样式
- * @param status 账号状态
+ * 判断账号是否正在被限流
  */
-function statusStyle(status: string): { class: string; label: string } {
-  if (status === 'active') return { class: 'bg-emerald-50 text-emerald-700 border-emerald-200', label: '活跃' };
-  if (status === 'error') return { class: 'bg-red-50 text-red-600 border-red-200', label: '异常' };
+function isRateLimited(a: Account): boolean {
+  return !!(a.rate_limit_reset_at && new Date(a.rate_limit_reset_at) > new Date());
+}
+
+/**
+ * 获取状态徽章样式
+ */
+function statusStyle(a: Account): { class: string; label: string } {
+  if (a.status === 'active' && isRateLimited(a)) {
+    return { class: 'bg-amber-50 text-amber-700 border-amber-200', label: '限流中' };
+  }
+  if (a.status === 'active') return { class: 'bg-emerald-50 text-emerald-700 border-emerald-200', label: '活跃' };
+  if (a.status === 'error') return { class: 'bg-red-50 text-red-600 border-red-200', label: '异常' };
   return { class: 'bg-gray-100 text-gray-500 border-gray-200', label: '停用' };
 }
 
@@ -372,7 +385,7 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
         v-for="a in accounts"
         :key="a.id"
         class="bg-white border-[#e8e2d9] rounded-xl hover:shadow-md transition-all duration-200 overflow-hidden"
-        :class="a.status === 'disabled' ? 'opacity-60' : ''"
+        :class="(a.status === 'disabled' || isRateLimited(a)) ? 'opacity-60' : ''"
       >
         <div class="p-5 space-y-3">
           <!-- 头部：名称 + 状态 -->
@@ -386,8 +399,8 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
                 <p v-if="a.name" class="text-xs text-[#8c8475] truncate">{{ a.email }}</p>
               </div>
             </div>
-            <Badge :class="statusStyle(a.status).class" class="border text-xs font-medium flex-shrink-0">
-              {{ statusStyle(a.status).label }}
+            <Badge :class="statusStyle(a).class" class="border text-xs font-medium flex-shrink-0">
+              {{ statusStyle(a).label }}
             </Badge>
           </div>
 
@@ -488,6 +501,20 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
             </div>
           </div>
 
+          <!-- 停用原因 -->
+          <div
+            v-if="a.disable_reason && (a.status === 'disabled' || (a.rate_limit_reset_at && new Date(a.rate_limit_reset_at) > new Date()))"
+            class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border"
+            :class="a.status === 'disabled' ? 'bg-red-50 border-red-200' : 'bg-amber-50 border-amber-200'"
+          >
+            <span class="text-xs font-medium" :class="a.status === 'disabled' ? 'text-red-600' : 'text-amber-700'">
+              {{ a.disable_reason }}
+            </span>
+            <span v-if="a.rate_limit_reset_at && new Date(a.rate_limit_reset_at) > new Date()" class="text-xs text-amber-500">
+              · 剩余 {{ formatTimeLeft(a.rate_limit_reset_at) }}
+            </span>
+          </div>
+
           <!-- 测试结果 -->
           <div
             v-if="testing === a.id && testResult"
@@ -503,12 +530,12 @@ function setAuthType(authType: 'setup_token' | 'oauth') {
               variant="ghost"
               size="sm"
               @click="toggleScheduling(a)"
-              :class="a.status === 'disabled'
+              :class="(a.status === 'disabled' || isRateLimited(a))
                 ? 'text-emerald-500 hover:text-emerald-600 hover:bg-emerald-50'
                 : 'text-amber-500 hover:text-amber-600 hover:bg-amber-50'"
               class="h-8 px-3 text-xs flex-1"
             >
-              {{ a.status === 'disabled' ? '启用' : '停用' }}
+              {{ (a.status === 'disabled' || isRateLimited(a)) ? '启用' : '停用' }}
             </Button>
             <Button
               variant="ghost"

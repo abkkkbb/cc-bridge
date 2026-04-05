@@ -284,6 +284,22 @@ impl AccountService {
     ) -> Result<(), AppError> {
         self.store.set_rate_limit(id, reset_at).await
     }
+
+    pub async fn disable_account(
+        &self,
+        id: i64,
+        status: crate::model::account::AccountStatus,
+        reason: &str,
+        rate_limit_reset_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<(), AppError> {
+        self.store
+            .disable_account(id, status, reason, rate_limit_reset_at)
+            .await
+    }
+
+    pub async fn enable_account(&self, id: i64) -> Result<(), AppError> {
+        self.store.enable_account(id).await
+    }
 }
 
 fn normalize_account_auth(account: &mut Account) -> Result<(), AppError> {
