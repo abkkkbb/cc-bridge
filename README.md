@@ -1,56 +1,136 @@
+<div align="center">
+
 # CC-Bridge
 
-基于 Rust 实现的 CC 反检测网关与账号池管理平台。将网关转发、账号调度、令牌鉴权、用量管理和 Web 管理后台整合到单一二进制文件中。
+### Claude Code Anti-Detection Gateway & Account Pool Manager
+
+[![Release](https://img.shields.io/github/v/release/MamoWorks/cc-bridge?style=flat-square&color=blue)](https://github.com/MamoWorks/cc-bridge/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/MamoWorks/cc-bridge/release.yml?style=flat-square)](https://github.com/MamoWorks/cc-bridge/actions)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-green?style=flat-square)](./craftls/LICENSE)
+[![Rust](https://img.shields.io/badge/rust-%E2%89%A51.82-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue?style=flat-square&logo=docker)](https://ghcr.io/mamoworks/claude-code-gateway)
+
+<br/>
+
+**基于 Rust 的高性能 Claude Code 反检测网关** — 将网关转发、账号调度、令牌鉴权、用量管理和 Web 管理后台整合到单一二进制文件中。
+
+[快速开始](#-快速开始) &bull; [配置说明](#-配置说明) &bull; [API 文档](#-http-api) &bull; [部署指南](#-构建与部署)
+
+</div>
+
+---
+
+## 目录
+
+- [核心能力](#-核心能力)
+- [快速开始](#-快速开始)
+- [配置说明](#-配置说明)
+- [构建与部署](#-构建与部署)
+- [HTTP API](#-http-api)
+- [OAuth 授权登录](#-oauth-授权登录)
+- [自动遥测](#-自动遥测)
+- [架构概览](#-架构概览)
+- [项目结构](#-项目结构)
+- [CI/CD](#-cicd)
+- [限制与注意事项](#-限制与注意事项)
+- [内部工作机制](#-网关内部工作机制)
+- [数据库表结构](#-数据库表结构)
+- [贡献者](#-贡献者)
+
+---
 
 ## 核心能力
 
-- **多账号池**：维护多个 Claude 账号，支持 Setup Token 和 OAuth 双认证模式
-- **令牌鉴权**：通过 API Token 对调用方鉴权，不暴露真实账号凭证
-- **粘性会话**：同一会话 24h 内命中同一账号，降低行为漂移
-- **优先级调度**：按 `priority` 升序选号，同优先级随机
-- **并发控制**：每账号独立并发上限，支持 Redis 或内存计数
-- **自动限速回避**：429 → 暂停 5h；403 → 永久停用（限流期内的 403 跳过，避免误判）
-- **手动启停**：管理后台一键启用/停用账号
-- **请求反检测改写**：改写 UA、系统提示、环境指纹、遥测字段
-- **AI Gateway 指纹过滤**：过滤 LiteLLM / Helicone / Portkey / Cloudflare AI Gateway / Kong / BrainTrust 响应头
-- **TLS 指纹伪装**：自定义 `craftls` 复现 Node.js 风格 ClientHello
-- **OAuth 授权登录**：内置 PKCE 流程，一键授权获取凭证
-- **自动遥测**：网关代发遥测请求，10min TTL 自动续期
-- **管理后台**：Vue 3 Web 界面，账号/令牌增删改查、连接测试、用量刷新、仪表盘
-- **多存储后端**：SQLite / PostgreSQL + Redis / 内存缓存
+<table>
+<tr>
+<td width="50%">
+
+**账号管理**
+- 多账号池，Setup Token + OAuth 双认证
+- 粘性会话 24h 绑定同一账号
+- 优先级调度 + 同优先级随机
+- 每账号独立并发上限
+- 429 暂停 5h / 403 永久停用
+- 手动一键启停
+
+</td>
+<td width="50%">
+
+**反检测引擎**
+- UA / 系统提示 / 环境指纹改写
+- TLS 指纹伪装（自定义 `craftls`，模拟 Node.js ClientHello）
+- AI Gateway 响应头过滤（LiteLLM / Helicone / Portkey / Cloudflare / Kong / BrainTrust）
+- 自动遥测代发，10min TTL 续期
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**鉴权与安全**
+- API Token 鉴权，不暴露真实凭证
+- OAuth PKCE 内置授权流程
+- 管理后台密码保护
+
+</td>
+<td width="50%">
+
+**平台支持**
+- Vue 3 Web 管理后台
+- SQLite / PostgreSQL 双数据库
+- Redis / 内存缓存
+- Docker 多架构镜像
+- Linux / Windows 单二进制分发
+
+</td>
+</tr>
+</table>
+
+---
 
 ## 快速开始
 
 ### 环境要求
 
-- Rust ≥ 1.82、Node.js 22、npm
-- 可选：Redis、PostgreSQL、Docker、Zig + `cargo-zigbuild`（交叉编译）
+| 依赖 | 版本 | 说明 |
+|------|------|------|
+| Rust | >= 1.82 | 后端编译 |
+| Node.js | 22 | 前端构建 |
+| npm | - | 随 Node.js 安装 |
+| Redis | 可选 | 多实例部署需要 |
+| PostgreSQL | 可选 | 默认使用 SQLite |
+| Docker | 可选 | 容器化部署 |
 
-### 启动
+### 三步启动
 
 ```bash
+# 1. 克隆项目
+git clone https://github.com/MamoWorks/cc-bridge.git
+cd cc-bridge
+
+# 2. 配置环境
 cp .env.example .env
+
+# 3. 启动服务
 ./scripts/dev.sh          # Linux / macOS
 # scripts\dev.bat         # Windows
 ```
 
-启动后：
+### 启动后入口
 
-| 入口 | 地址 |
-| --- | --- |
-| 管理后台 | `http://127.0.0.1:5674/` |
-| 登录页 | `http://127.0.0.1:5674/login` |
-| 网关 | 除前端页面、`/assets/*`、`/admin/*` 外的所有路径 |
+| 入口 | 地址 | 说明 |
+|------|------|------|
+| 管理后台 | `http://127.0.0.1:5674/` | Vue 3 Web 界面 |
+| 登录页 | `http://127.0.0.1:5674/login` | 默认密码 `admin` |
+| API 网关 | `http://127.0.0.1:5674/*` | 除保留路径外的所有请求 |
 
-默认管理员密码：`admin`
+### 基本使用流程
 
-### 基本使用
+```
+1. 登录管理后台 → 2. 新建账号（手动 / OAuth 一键授权）→ 3. 创建 API Token → 4. 调用网关
+```
 
-1. 登录管理后台
-2. 新建账号（手动填写或点击"授权登录"通过 OAuth 一键授权）
-3. 建议同时填写 `account_uuid`、`organization_uuid`、`subscription_type`
-4. 在"令牌"页面创建 API Token
-5. 调用网关时使用 `x-api-key: sk-...` 或 `Authorization: Bearer sk-...`
+> **建议**：创建账号时同时填写 `account_uuid`、`organization_uuid`、`subscription_type`
 
 ### 调用示例
 
@@ -65,45 +145,47 @@ curl http://127.0.0.1:5674/v1/messages \
   }'
 ```
 
+---
+
 ## 配置说明
 
-通过 `.env` 文件或环境变量配置，优先级：进程环境变量 > `.env` > 代码默认值。
+通过 `.env` 文件或环境变量配置。优先级：**进程环境变量 > `.env` > 代码默认值**。
 
 ### 服务端
 
 | 变量 | 默认值 | 说明 |
-| --- | --- | --- |
+|------|--------|------|
 | `SERVER_HOST` | `0.0.0.0` | 监听地址 |
 | `SERVER_PORT` | `5674` | 监听端口 |
-| `TLS_CERT_FILE` | 空 | 证书路径（当前未接入 TLS 监听，需反代） |
-| `TLS_KEY_FILE` | 空 | 私钥路径 |
+| `TLS_CERT_FILE` | - | 证书路径（需反代终止 TLS） |
+| `TLS_KEY_FILE` | - | 私钥路径 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `ADMIN_PASSWORD` | `admin` | 管理后台共享密码 |
+| `ADMIN_PASSWORD` | `admin` | 管理后台密码 |
 
 ### 数据库
 
 | 变量 | 默认值 | 说明 |
-| --- | --- | --- |
+|------|--------|------|
 | `DATABASE_DRIVER` | `sqlite` | `sqlite` 或 `postgres` |
 | `DATABASE_DSN` | `data/claude-code-gateway.db` | 完整 DSN，设置后优先使用 |
-| `DATABASE_HOST` | `localhost` | PostgreSQL 主机（DSN 为空时拼接） |
+| `DATABASE_HOST` | `localhost` | PostgreSQL 主机 |
 | `DATABASE_PORT` | `5432` | PostgreSQL 端口 |
 | `DATABASE_USER` | `postgres` | PostgreSQL 用户名 |
-| `DATABASE_PASSWORD` | 空 | PostgreSQL 密码 |
+| `DATABASE_PASSWORD` | - | PostgreSQL 密码 |
 | `DATABASE_DBNAME` | `claude_code_gateway` | PostgreSQL 数据库名 |
 
-SQLite 自动创建目录并启用 WAL 模式。PostgreSQL 无 DSN 时自动拼接连接串。
+> SQLite 自动创建目录并启用 WAL 模式。PostgreSQL 无 DSN 时自动拼接连接串。
 
 ### Redis（可选）
 
 | 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `REDIS_HOST` | 空 | 不设置则使用内存缓存 |
+|------|--------|------|
+| `REDIS_HOST` | - | 不设置则使用内存缓存 |
 | `REDIS_PORT` | `6379` | 端口 |
-| `REDIS_PASSWORD` | 空 | 密码 |
+| `REDIS_PASSWORD` | - | 密码 |
 | `REDIS_DB` | `0` | 数据库编号 |
 
-Redis 用于粘性会话和并发计数。单实例无需 Redis，多实例部署请启用。
+> 单实例无需 Redis，多实例部署请启用以共享会话粘性和并发计数。
 
 ### 最小配置
 
@@ -116,17 +198,19 @@ ADMIN_PASSWORD=change-me
 LOG_LEVEL=info
 ```
 
+---
+
 ## 构建与部署
 
-### 开发
+### 开发模式
 
 ```bash
-# 方式一：脚本启动（自动检测前端变更）
+# 方式一：一键启动（自动检测前端变更）
 ./scripts/dev.sh
 
 # 方式二：前后端分离
-cd web && npm ci && npm run dev   # 终端 A：前端 :3000
-cargo run                          # 终端 B：后端 :5674
+cd web && npm ci && npm run dev    # 终端 A：前端 :3000
+cargo run                           # 终端 B：后端 :5674
 ```
 
 ### 生产构建
@@ -145,33 +229,39 @@ cargo build --release
 ./target/release/claude-code-gateway
 ```
 
-### Docker
+### Docker 部署
 
 ```bash
 cp .env.example .env
 cd docker && docker compose up -d
 ```
 
-SQLite 数据持久化到命名卷 `claude-code-gateway-data`。
+> SQLite 数据持久化到命名卷 `claude-code-gateway-data`。
 
 ### 生产建议
 
-- 使用 Nginx / Caddy 等反代做 TLS 终止
-- 设置强随机 `ADMIN_PASSWORD`
-- 多实例部署启用 Redis
-- 对管理后台路径做网络隔离
+| 建议 | 说明 |
+|------|------|
+| TLS 终止 | 使用 Nginx / Caddy 等反代 |
+| 强密码 | 设置强随机 `ADMIN_PASSWORD` |
+| Redis | 多实例部署启用 |
+| 网络隔离 | 管理后台路径做访问控制 |
+
+---
 
 ## HTTP API
 
-### 认证
+### 认证方式
 
-- **管理 API**：`x-api-key: <ADMIN_PASSWORD>` 或 `Authorization: Bearer <ADMIN_PASSWORD>`
-- **网关 API**：`x-api-key: <sk-...>` 或 `Authorization: Bearer <sk-...>`
+| 类型 | Header |
+|------|--------|
+| 管理 API | `x-api-key: <ADMIN_PASSWORD>` 或 `Authorization: Bearer <ADMIN_PASSWORD>` |
+| 网关 API | `x-api-key: <sk-...>` 或 `Authorization: Bearer <sk-...>` |
 
 ### 管理接口
 
 | 方法 | 路径 | 说明 |
-| --- | --- | --- |
+|------|------|------|
 | `GET` | `/admin/dashboard` | 仪表盘统计 |
 | `GET` | `/admin/accounts` | 账号列表（`page`/`page_size`） |
 | `POST` | `/admin/accounts` | 创建账号 |
@@ -188,18 +278,20 @@ SQLite 数据持久化到命名卷 `claude-code-gateway-data`。
 | `POST` | `/admin/oauth/exchange-code` | 交换 OAuth 授权码 |
 | `POST` | `/admin/oauth/exchange-setup-token-code` | 交换 Setup Token 授权码 |
 
-### 网关接口
+### 网关转发
 
 所有未命中前端页面、`/assets/*`、`/admin/*` 的请求进入网关 fallback，经 API Token 鉴权后转发到 `https://api.anthropic.com`。
 
 ### 保留路径
 
-`/`、`/login`、`/tokens`、`/favicon.svg`、`/assets/*`、`/admin/*` 不会进入网关。
+`/`、`/login`、`/tokens`、`/favicon.svg`、`/assets/*`、`/admin/*` 不进入网关。
 
 ### 创建账号示例
 
+<details>
+<summary><b>Setup Token 模式</b></summary>
+
 ```bash
-# Setup Token 模式
 curl -X POST http://127.0.0.1:5674/admin/accounts \
   -H "Authorization: Bearer admin" \
   -H "Content-Type: application/json" \
@@ -217,8 +309,14 @@ curl -X POST http://127.0.0.1:5674/admin/accounts \
     "priority": 50,
     "auto_telemetry": false
   }'
+```
 
-# OAuth 模式
+</details>
+
+<details>
+<summary><b>OAuth 模式</b></summary>
+
+```bash
 curl -X POST http://127.0.0.1:5674/admin/accounts \
   -H "Authorization: Bearer admin" \
   -H "Content-Type: application/json" \
@@ -239,7 +337,10 @@ curl -X POST http://127.0.0.1:5674/admin/accounts \
   }'
 ```
 
-### 创建令牌示例
+</details>
+
+<details>
+<summary><b>创建令牌</b></summary>
 
 ```bash
 curl -X POST http://127.0.0.1:5674/admin/tokens \
@@ -248,53 +349,87 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
   -d '{"name": "team-a", "allowed_accounts": "1,2", "blocked_accounts": ""}'
 ```
 
+</details>
+
 ### 错误响应
 
-统一格式 `{"error": "..."}`，常见状态码：400 / 401 / 404 / 429 / 502 / 503 / 500。
+统一格式 `{"error": "..."}`，常见状态码：`400` / `401` / `404` / `429` / `502` / `503` / `500`。
+
+---
 
 ## OAuth 授权登录
 
 管理后台内置 OAuth PKCE 授权流程：
 
-1. 点击"授权登录"，选择模式：
-   - **OAuth（完整权限）**：获取 access_token + refresh_token
-   - **Setup Token（仅推理）**：获取 365 天有效的 access_token
+1. 点击 **"授权登录"**，选择模式：
+   - **OAuth（完整权限）**：获取 `access_token` + `refresh_token`
+   - **Setup Token（仅推理）**：获取 365 天有效的 `access_token`
 2. 可选填写代理地址
 3. 复制授权链接到浏览器完成登录
 4. 从回调 URL 复制 `code`，粘贴到管理后台交换
 5. 系统自动获取凭证和 `account_uuid`、`organization_uuid`、`email` 等信息
-6. 点击"应用到新账号"自动填入表单
+6. 点击 **"应用到新账号"** 自动填入表单
 
 > 授权会话有效期 30 分钟。
+
+---
 
 ## 自动遥测
 
 开启 `auto_telemetry` 后，网关代替客户端发送遥测：
 
-- **拦截**：客户端遥测请求返回 200，不转发上游
-- **代发**：`/api/event_logging/batch`（每 10s）、`/api/eval/sdk-*`（每 6h）
-- **触发**：账号收到 `/v1/messages` 请求时激活遥测会话（10min TTL，自动续期）
-- **拦截路径**：`/api/event_logging/batch`、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled`
+| 功能 | 说明 |
+|------|------|
+| **拦截** | 客户端遥测请求返回 200，不转发上游 |
+| **代发** | `/api/event_logging/batch`（每 10s）、`/api/eval/sdk-*`（每 6h） |
+| **触发** | 账号收到 `/v1/messages` 请求时激活遥测会话（10min TTL，自动续期） |
+| **拦截路径** | `/api/event_logging/batch`、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled` |
 
 > Datadog 遥测由客户端直连 `browser-intake-datadoghq.com`，无法通过网关拦截。建议在网络层屏蔽。
 
-## CI/CD
+---
 
-通过 `.version` 文件控制发布版本。GitHub Actions 工作流（`.github/workflows/release.yml`）：
+## 架构概览
 
-- **自动触发**：推送到 `main` 且 `.version` 有变更
-- **手动触发**：`workflow_dispatch`
-- **产物**：Linux x86_64/arm64 + Windows x86_64 二进制、GHCR 多架构 Docker 镜像（`latest` / `<version>` / `v<version>`）
+```
+                                    CC-Bridge
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│   Client Request                                                    │
+│        │                                                            │
+│        v                                                            │
+│   ┌─────────┐    ┌──────────┐    ┌───────────┐    ┌─────────────┐  │
+│   │  Auth    │───>│ Account  │───>│ Rewriter  │───>│  craftls    │──│──> api.anthropic.com
+│   │Middleware│    │Scheduler │    │  Engine   │    │ TLS Spoof   │  │
+│   └─────────┘    └──────────┘    └───────────┘    └─────────────┘  │
+│        │              │                                             │
+│        v              v                                             │
+│   ┌─────────┐    ┌──────────┐                                      │
+│   │  Token   │    │ Session  │                                      │
+│   │  Store   │    │ Sticky   │                                      │
+│   └─────────┘    └──────────┘                                      │
+│        │              │                                             │
+│        v              v                                             │
+│   ┌──────────────────────────────┐                                  │
+│   │   SQLite / PostgreSQL        │                                  │
+│   │   Redis / Memory Cache       │                                  │
+│   └──────────────────────────────┘                                  │
+│                                                                     │
+│   ┌──────────────────────────────┐                                  │
+│   │   Vue 3 Web Dashboard        │    :5674                        │
+│   └──────────────────────────────┘                                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-发布步骤：修改 `.version` 中的 `version` → 合入 `main` → 等待自动构建。
+---
 
 ## 项目结构
 
 ```text
-.
+cc-bridge/
 ├── .github/workflows/       # GitHub Actions 发布流程
 ├── craftls/                 # 自定义 rustls 分支（TLS 指纹伪装）
-├── docker/                  # Dockerfile 与 docker-compose.yml
+├── docker/                  # Dockerfile & docker-compose.yml
 ├── scripts/                 # 开发与构建脚本
 ├── src/
 │   ├── main.rs              # 程序入口
@@ -307,7 +442,7 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 │   ├── store/               # 数据库与缓存访问层
 │   └── tlsfp/               # TLS 指纹客户端
 ├── web/                     # Vue 3 前端
-│   ├── src/components/      # 页面组件
+│   ├── src/components/      # 页面组件（Dashboard / Accounts / Tokens / Login）
 │   ├── src/api.ts           # API 封装
 │   └── vite.config.ts       # Vite 配置
 ├── .env.example             # 配置模板
@@ -315,20 +450,42 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 └── Cargo.toml               # Rust 项目清单
 ```
 
+---
+
+## CI/CD
+
+通过 `.version` 文件控制发布版本。GitHub Actions 工作流：
+
+| 触发方式 | 条件 |
+|----------|------|
+| 自动触发 | 推送到 `main` 且 `.version` 有变更 |
+| 手动触发 | `workflow_dispatch` |
+
+**产物：**
+- Linux x86_64 / arm64 二进制
+- Windows x86_64 二进制
+- GHCR 多架构 Docker 镜像（`latest` / `<version>` / `v<version>`）
+
+**发布步骤：** 修改 `.version` 中的 `version` → 合入 `main` → 等待自动构建。
+
+---
+
 ## 限制与注意事项
 
-1. **TLS 未接入 HTTPS 监听**：需使用 Nginx / Caddy / Traefik 等反代做 TLS 终止
-2. **无显式 `/_health` 和 `/v1/models`**：这些路径会进入网关 fallback 转发到上游
-3. **Token 明文存储**：账号凭证和 API Token 以明文存储在数据库中，请保护数据库访问
-4. **单共享密码**：无多用户/权限系统，建议强密码 + 可信网络 + 反代访问控制
-5. **多实例需 Redis**：否则会话粘性和并发计数无法跨实例共享
-6. **版本号硬编码**：identity 模块中的 Claude Code 版本号（当前 `2.1.81`）和构建时间为静态值，上游更新后需手动同步
-7. **Datadog 遥测无法拦截**：客户端直连发送，建议网络层屏蔽
+| # | 限制 | 说明 |
+|---|------|------|
+| 1 | TLS 未接入 HTTPS 监听 | 需使用 Nginx / Caddy / Traefik 反代做 TLS 终止 |
+| 2 | 无显式 `/_health` 和 `/v1/models` | 这些路径进入网关 fallback 转发到上游 |
+| 3 | Token 明文存储 | 凭证以明文存储在数据库中，请保护数据库访问 |
+| 4 | 单共享密码 | 无多用户/权限系统，建议强密码 + 可信网络 + 反代访问控制 |
+| 5 | 多实例需 Redis | 否则会话粘性和并发计数无法跨实例共享 |
+| 6 | 版本号硬编码 | identity 模块中的版本号为静态值，上游更新后需手动同步 |
+| 7 | Datadog 遥测无法拦截 | 客户端直连发送，建议网络层屏蔽 |
 
 ---
 
 <details>
-<summary><strong>网关内部工作机制</strong>（点击展开）</summary>
+<summary><h2>网关内部工作机制</h2></summary>
 
 ### 请求鉴权
 
@@ -336,14 +493,16 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 
 ### 客户端类型识别
 
-- `User-Agent` 以 `claude-code/` 或 `claude-cli/` 开头 → Claude Code 模式
-- 请求体 `metadata.user_id` 存在 → Claude Code 模式
-- 其余 → 纯 API 模式
+| 特征 | 模式 |
+|------|------|
+| `User-Agent` 以 `claude-code/` 或 `claude-cli/` 开头 | Claude Code |
+| 请求体 `metadata.user_id` 存在 | Claude Code |
+| 其余 | 纯 API |
 
 ### 会话哈希
 
-- Claude Code：从 `metadata.user_id` 解析 `session_id`
-- 纯 API：`sha256(UA + system/首条消息 + 小时窗口)`
+- **Claude Code**：从 `metadata.user_id` 解析 `session_id`
+- **纯 API**：`sha256(UA + system/首条消息 + 小时窗口)`
 
 ### 账号过滤
 
@@ -362,11 +521,11 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 ### 限速与停用
 
 | 上游状态码 | 行为 | 持续时间 |
-| --- | --- | --- |
+|-----------|------|---------|
 | `429` | 暂停调度（状态保持 active） | 5 小时自动恢复 |
 | `403` | 永久停用（标记 disabled） | 手动启用 |
 
-429 限流期内的 403 不会触发永久停用。
+> 429 限流期内的 403 不会触发永久停用。
 
 ### 请求头改写
 
@@ -379,7 +538,7 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 ### 请求体改写
 
 | 路径 | 改写内容 |
-| --- | --- |
+|------|---------|
 | `/v1/messages` | 系统提示词注入、`metadata.user_id`、环境/进程指纹、`cache_control`、billing 处理 |
 | `/api/event_logging/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
 | `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、移除 `apiBaseUrlHost` |
@@ -396,12 +555,12 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 </details>
 
 <details>
-<summary><strong>数据库表结构</strong>（点击展开）</summary>
+<summary><h2>数据库表结构</h2></summary>
 
 ### `accounts` 表
 
 | 字段 | 说明 |
-| --- | --- |
+|------|------|
 | `id` | 主键 |
 | `name` / `email` | 账号标识（email 检查重复） |
 | `status` | `active` / `error` / `disabled` |
@@ -422,22 +581,22 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 ### `api_tokens` 表
 
 | 字段 | 说明 |
-| --- | --- |
+|------|------|
 | `id` | 主键 |
 | `name` | 令牌名称 |
 | `token` | 自动生成的 `sk-...` 令牌 |
 | `allowed_accounts` / `blocked_accounts` | 账号 ID 列表（逗号分隔） |
 | `status` | `active` / `disabled` |
 
-服务启动时自动执行内建 SQL 迁移，不依赖外部 migration 文件。
+> 服务启动时自动执行内建 SQL 迁移，不依赖外部 migration 文件。
 
 </details>
 
 <details>
-<summary><strong>账号字段参考</strong>（点击展开）</summary>
+<summary><h2>账号字段参考</h2></summary>
 
 | 字段 | 必填 | 说明 |
-| --- | --- | --- |
+|------|------|------|
 | `email` | 是 | 账号邮箱 |
 | `auth_type` | 否 | `setup_token`（默认）或 `oauth` |
 | `setup_token` / `token` | 条件 | Setup Token 模式必填 |
@@ -453,10 +612,59 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 | `priority` | 否 | 数值越小优先级越高，默认 50 |
 | `auto_telemetry` | 否 | 是否开启自动遥测，默认 false |
 
-创建时系统自动生成 `device_id`、`canonical_env`、`canonical_prompt_env`、`canonical_process`。
+> 创建时系统自动生成 `device_id`、`canonical_env`、`canonical_prompt_env`、`canonical_process`。
 
 </details>
 
+---
+
 ## 许可与依赖说明
 
-项目包含自定义 `craftls` 目录。发布时请检查该目录下的许可证文件。
+项目包含自定义 `craftls` 目录（基于 [rustls](https://github.com/rustls/rustls) 分支）。详见 `craftls/` 下的许可证文件。
+
+---
+
+## 贡献者
+
+<table>
+<tr>
+<td align="center">
+<a href="https://github.com/Rfym21">
+<img src="https://github.com/Rfym21.png" width="80px;" alt="Rfym21"/>
+<br/>
+<sub><b>Rfym21</b></sub>
+</a>
+</td>
+<td align="center">
+<a href="https://github.com/FF-crazy">
+<img src="https://github.com/FF-crazy.png" width="80px;" alt="FF-crazy"/>
+<br/>
+<sub><b>FF-crazy</b></sub>
+</a>
+</td>
+<td align="center">
+<a href="https://github.com/kao0312">
+<img src="https://github.com/kao0312.png" width="80px;" alt="kao0312"/>
+<br/>
+<sub><b>kao0312</b></sub>
+</a>
+</td>
+<td align="center">
+<a href="https://github.com/2830897438">
+<img src="https://github.com/2830897438.png" width="80px;" alt="2830897438"/>
+<br/>
+<sub><b>2830897438</b></sub>
+</a>
+</td>
+</tr>
+</table>
+
+---
+
+<div align="center">
+
+**[MamoWorks](https://github.com/MamoWorks)** &copy; 2025
+
+[![Star History Chart](https://api.star-history.com/svg?repos=MamoWorks/cc-bridge&type=Date)](https://star-history.com/#MamoWorks/cc-bridge&Date)
+
+</div>
