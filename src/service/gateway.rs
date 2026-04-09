@@ -278,25 +278,14 @@ impl GatewayService {
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
 
-        // 处理限速：429 自动停用 5 小时
+        // 处理限速：429 根据账号类型分别处理
+        // - SetupToken: 保守 5h 限流
+        // - OAuth: 查用量判断是撞墙（5h / 7d）还是纯 rate limit，分别设置限流时长
         if status_code == 429 {
-            let reset_at = Utc::now() + chrono::Duration::hours(5);
-            if let Err(e) = self
-                .account_svc
-                .disable_account(
-                    account.id,
-                    AccountStatus::Active,
-                    "429 速率限制",
-                    Some(reset_at),
-                )
-                .await
-            {
-                warn!("failed to disable account {} for 429: {}", account.id, e);
-            } else {
+            if let Err(e) = self.account_svc.handle_rate_limit(account).await {
                 warn!(
-                    "account {} rate limited for 5h until {}",
-                    account.id,
-                    reset_at.to_rfc3339()
+                    "failed to handle rate limit for account {}: {}",
+                    account.id, e
                 );
             }
         }
