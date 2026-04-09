@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { api, type Account, type OAuthExchangeResult } from '../api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -86,7 +86,23 @@ const visiblePages = computed(() => {
   return pages;
 });
 
-onMounted(load);
+/** 自动重载定时器 */
+let autoReloadTimer: ReturnType<typeof setInterval> | null = null;
+
+onMounted(() => {
+  load();
+  // 每 60 秒静默重拉账户列表（usage_data 会带新值过来）
+  autoReloadTimer = setInterval(() => {
+    load();
+  }, 60 * 1000);
+});
+
+onUnmounted(() => {
+  if (autoReloadTimer) {
+    clearInterval(autoReloadTimer);
+    autoReloadTimer = null;
+  }
+});
 
 /** 打开新建账号弹窗 */
 function openCreate() {
