@@ -200,6 +200,41 @@ ADMIN_PASSWORD=change-me
 LOG_LEVEL=info
 ```
 
+### 完整配置方案
+```env
+# =========================
+# cc-bridge
+# =========================
+
+# --- server ---
+SERVER_HOST=0.0.0.0
+SERVER_PORT=5674
+LOG_LEVEL=info
+ADMIN_PASSWORD=change-this-admin-password
+USAGE_POLL_INTERVAL_SECS=300
+
+# --- postgres ---
+DATABASE_DRIVER=postgres
+DATABASE_HOST=postgres
+DATABASE_PORT=5432
+DATABASE_USER=postgres
+DATABASE_PASSWORD=change-this-db-password
+DATABASE_DBNAME=ccgateway
+
+# 可选：如果你想直接用 DSN，也可以改成下面这种，并删掉上面 5 个 DATABASE_* 分项
+# DATABASE_DSN=postgres://postgres:change-this-db-password@postgres:5432/ccgateway
+
+# --- redis ---
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=change-this-redis-password
+REDIS_DB=0
+
+# --- tls (optional) ---
+# TLS_CERT_FILE=
+# TLS_KEY_FILE=
+```
+
 ---
 
 ## 构建与部署
@@ -237,6 +272,8 @@ cargo build --release
 cp .env.example .env
 cd docker && docker compose up -d
 ```
+
+
 
 > SQLite 数据持久化到命名卷 `claude-code-gateway-data`。
 
