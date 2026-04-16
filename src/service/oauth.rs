@@ -49,7 +49,7 @@ impl TokenTester {
         let env: CanonicalEnvData =
             serde_json::from_value(canonical_env.clone()).unwrap_or_default();
         let version = if env.version.is_empty() {
-            "2.1.81"
+            "2.1.109"
         } else {
             &env.version
         };
@@ -73,13 +73,15 @@ impl TokenTester {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05")
+            .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05")
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("User-Agent", format!("claude-cli/{} (external, cli)", version))
             .header("x-app", "cli")
-            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .header("accept-encoding", "br, gzip, deflate")
+            .header("accept-language", "*")
+            .header("sec-fetch-mode", "cors")
             .header("X-Stainless-Lang", "js")
-            .header("X-Stainless-Package-Version", "0.70.0")
+            .header("X-Stainless-Package-Version", "0.81.0")
             .header("X-Stainless-OS", stainless_os)
             .header("X-Stainless-Arch", &env.arch)
             .header("X-Stainless-Runtime", "node")
@@ -166,7 +168,7 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", "claude-code/2.1.81")
+        .header("User-Agent", "claude-code/2.1.109")
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("usage request failed: {}", e)))?;

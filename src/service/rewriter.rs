@@ -59,7 +59,7 @@ pub enum ClientType {
     API,
 }
 
-const DEFAULT_VERSION: &str = "2.1.81";
+const DEFAULT_VERSION: &str = "2.1.109";
 
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
 fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
@@ -95,9 +95,7 @@ pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
     let lower = model_id.to_lowercase();
     let is_haiku = lower.contains("haiku");
     let is_claude3 = lower.contains("claude-3-");
-    // firstParty: ISP 等价于 !claude-3-*（源码 betas.ts:107）
     let supports_isp = !is_claude3;
-    // modelSupportsContextManagement: Claude 4+（源码 betas.ts:134-138）
     let is_claude4_plus = lower.contains("claude-opus-4")
         || lower.contains("claude-sonnet-4")
         || lower.contains("claude-haiku-4");
@@ -106,17 +104,23 @@ pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
     if !is_haiku {
         out.push("claude-code-20250219");
     }
-    // claudeAISubscriber → OAUTH_BETA_HEADER
     out.push("oauth-2025-04-20");
+    if !is_haiku {
+        out.push("context-1m-2025-08-07");
+    }
     if supports_isp {
         out.push("interleaved-thinking-2025-05-14");
-        // REDACT_THINKING 取决于非交互/设置，代理默认发送交互态
         out.push("redact-thinking-2026-02-12");
     }
     if is_claude4_plus {
         out.push("context-management-2025-06-27");
     }
     out.push("prompt-caching-scope-2026-01-05");
+    if !is_haiku {
+        out.push("advisor-tool-2026-03-01");
+        out.push("advanced-tool-use-2025-11-20");
+        out.push("effort-2025-11-24");
+    }
     out
 }
 
@@ -170,10 +174,12 @@ impl Rewriter {
             );
             out.insert("x-app".into(), "cli".into());
             out.insert("content-type".into(), "application/json".into());
-            out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
+            out.insert("accept-encoding".into(), "br, gzip, deflate".into());
+            out.insert("accept-language".into(), "*".into());
+            out.insert("sec-fetch-mode".into(), "cors".into());
             let stainless_os = stainless_os_from_platform(&env.platform);
             out.insert("X-Stainless-Lang".into(), "js".into());
-            out.insert("X-Stainless-Package-Version".into(), "0.70.0".into());
+            out.insert("X-Stainless-Package-Version".into(), "0.81.0".into());
             out.insert("X-Stainless-OS".into(), stainless_os.into());
             out.insert("X-Stainless-Arch".into(), env.arch.clone());
             out.insert("X-Stainless-Runtime".into(), "node".into());
@@ -184,6 +190,9 @@ impl Rewriter {
             out.insert("X-Stainless-Retry-Count".into(), "0".into());
             out.insert("X-Stainless-Timeout".into(), "600".into());
 
+            // X-Claude-Code-Session-Id 和 x-client-request-id:
+            // v2.1.81 不发送这两个 header，v2.1.109 开始发送。
+            // 对齐 DEFAULT_VERSION=2.1.109 行为：保持发送。
             let session_id =
                 extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid);
             out.insert("X-Claude-Code-Session-Id".into(), session_id);
@@ -235,6 +244,10 @@ impl Rewriter {
                     }
                     "x-stainless-runtime-version" => {
                         out.insert(wire_key, env.node_version.clone());
+                    }
+                    "x-stainless-package-version" => {
+                        // 强制对齐最新 SDK 版本，防止泄露真实客户端 SDK 信息
+                        out.insert(wire_key, "0.81.0".into());
                     }
                     _ => {
                         out.insert(wire_key, v.clone());
@@ -340,13 +353,11 @@ impl Rewriter {
             // 剥离 system 块中的 cache_control
             strip_cache_control(body);
 
-            // 规范化 max_tokens
-            if let Some(max_tokens) = body.get("max_tokens").and_then(|v| v.as_f64()) {
-                if max_tokens > 32768.0 {
-                    body.as_object_mut()
-                        .unwrap()
-                        .insert("max_tokens".into(), serde_json::json!(16384));
-                }
+            // 确保 max_tokens 存在（真实 CLI v2.1.109 对 Opus 使用 64000）
+            if body.get("max_tokens").is_none() {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("max_tokens".into(), serde_json::json!(64000));
             }
 
             // 注入 Claude Code 系统提示词
