@@ -133,7 +133,10 @@ impl GatewayService {
                 }
 
                 if path.starts_with("/v1/messages") {
-                    self.telemetry_svc.activate_session(&account).await;
+                    let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
+                    self.telemetry_svc
+                        .activate_session(&account, model_id)
+                        .await;
                 }
             }
 

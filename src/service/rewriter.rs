@@ -81,13 +81,47 @@ fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
 }
 
 /// 根据模型返回正确的 anthropic-beta 值。
-fn beta_header_for_model(model_id: &str) -> &'static str {
+///
+/// 依据 Claude Code `src/utils/betas.ts` 对 firstParty provider 的规则复刻
+/// （cc-bridge 固定转发到 api.anthropic.com，即 firstParty + claudeAISubscriber）：
+///
+/// - `CLAUDE_CODE_20250219`: 仅非 Haiku 模型
+/// - `OAUTH_BETA_HEADER`   : 始终（claudeAISubscriber）
+/// - `INTERLEAVED_THINKING`: firstParty 规则 `!claude-3-*`
+/// - `REDACT_THINKING`     : 需 ISP 支持（等价于 `!claude-3-*`，默认交互式会话）
+/// - `CONTEXT_MANAGEMENT`  : Claude 4+ 模型（opus-4/sonnet-4/haiku-4）
+/// - `PROMPT_CACHING_SCOPE`: 始终（firstParty）
+pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
     let lower = model_id.to_lowercase();
-    if lower.contains("haiku") {
-        "oauth-2025-04-20,interleaved-thinking-2025-05-14"
-    } else {
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
+    let is_haiku = lower.contains("haiku");
+    let is_claude3 = lower.contains("claude-3-");
+    // firstParty: ISP 等价于 !claude-3-*（源码 betas.ts:107）
+    let supports_isp = !is_claude3;
+    // modelSupportsContextManagement: Claude 4+（源码 betas.ts:134-138）
+    let is_claude4_plus = lower.contains("claude-opus-4")
+        || lower.contains("claude-sonnet-4")
+        || lower.contains("claude-haiku-4");
+
+    let mut out: Vec<&'static str> = Vec::new();
+    if !is_haiku {
+        out.push("claude-code-20250219");
     }
+    // claudeAISubscriber → OAUTH_BETA_HEADER
+    out.push("oauth-2025-04-20");
+    if supports_isp {
+        out.push("interleaved-thinking-2025-05-14");
+        // REDACT_THINKING 取决于非交互/设置，代理默认发送交互态
+        out.push("redact-thinking-2026-02-12");
+    }
+    if is_claude4_plus {
+        out.push("context-management-2025-06-27");
+    }
+    out.push("prompt-caching-scope-2026-01-05");
+    out
+}
+
+fn beta_header_for_model(model_id: &str) -> String {
+    compute_betas_for_model(model_id).join(",")
 }
 
 /// 处理所有请求的反检测改写。
@@ -216,7 +250,7 @@ impl Rewriter {
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
             out.insert(
                 "anthropic-beta".into(),
-                merge_anthropic_beta(beta_header_for_model(model_id), &existing_beta),
+                merge_anthropic_beta(&beta_header_for_model(model_id), &existing_beta),
             );
         }
 
@@ -1197,4 +1231,75 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod beta_tests {
+    use super::compute_betas_for_model;
+
+    fn contains(set: &[&str], s: &str) -> bool {
+        set.iter().any(|x| *x == s)
+    }
+
+    #[test]
+    fn sonnet_4_5_gets_full_first_party_set() {
+        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
+        assert!(contains(&b, "claude-code-20250219"));
+        assert!(contains(&b, "oauth-2025-04-20"));
+        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(contains(&b, "redact-thinking-2026-02-12"));
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn opus_4_6_gets_full_first_party_set() {
+        let b = compute_betas_for_model("claude-opus-4-6");
+        assert!(contains(&b, "claude-code-20250219"));
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn haiku_4_5_excludes_claude_code_but_keeps_isp_and_context_mgmt() {
+        let b = compute_betas_for_model("claude-haiku-4-5");
+        // Haiku 分支不发 claude-code-20250219
+        assert!(!contains(&b, "claude-code-20250219"));
+        // 但仍支持 ISP / context management / prompt-caching-scope
+        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(contains(&b, "redact-thinking-2026-02-12"));
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+        assert!(contains(&b, "oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn haiku_3_5_strips_isp_and_context_mgmt() {
+        let b = compute_betas_for_model("claude-3-5-haiku-20241022");
+        assert!(!contains(&b, "claude-code-20250219"));
+        // claude-3-* 不支持 ISP（源码 betas.ts:107）
+        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&b, "redact-thinking-2026-02-12"));
+        // Claude 3 不支持 context-management
+        assert!(!contains(&b, "context-management-2025-06-27"));
+        // OAuth + prompt-caching-scope 仍存在
+        assert!(contains(&b, "oauth-2025-04-20"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn claude_3_opus_behaves_as_legacy() {
+        let b = compute_betas_for_model("claude-3-opus-20240229");
+        assert!(contains(&b, "claude-code-20250219")); // 非 haiku
+        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn ordering_is_stable_across_calls() {
+        let a = compute_betas_for_model("claude-sonnet-4-5");
+        let b = compute_betas_for_model("claude-sonnet-4-5");
+        assert_eq!(a, b);
+    }
 }

@@ -74,7 +74,14 @@ impl AccountStore {
                     .ok()
             })
             .or_else(|| {
+                // PG TIMESTAMPTZ::text 完整格式: "2026-04-16 12:30:45.123456+08:00"
                 DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%:z")
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok()
+            })
+            .or_else(|| {
+                // PG TIMESTAMPTZ::text 短时区格式: "2026-04-16 12:30:45+08"
+                DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%#z")
                     .map(|dt| dt.with_timezone(&Utc))
                     .ok()
             })
