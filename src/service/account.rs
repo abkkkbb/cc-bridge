@@ -167,6 +167,12 @@ impl AccountService {
         self.cache.release_slot(&key).await;
     }
 
+    /// 构造一个绑定到该账号并发槽的 SlotHolder（不会自行获取；调用者需先 acquire_slot）。
+    pub fn slot_holder_for(&self, account_id: i64) -> crate::service::gateway::SlotHolder {
+        let key = format!("concurrency:account:{}", account_id);
+        crate::service::gateway::SlotHolder::new(self.cache.clone(), key)
+    }
+
     /// 从 Anthropic API 获取账号用量并缓存到数据库。
     /// 仅支持 OAuth 账号，SetupToken 账号无法查询用量。
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
