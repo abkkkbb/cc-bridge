@@ -73,3 +73,5 @@ rustls = { path = "craftls/rustls" }
 
 [dev-dependencies]
 futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"
