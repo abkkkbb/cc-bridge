@@ -2,10 +2,13 @@ use crate::config::DatabaseConfig;
 use sqlx::AnyPool;
 use sqlx::Connection;
 use sqlx::postgres::PgConnection;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
+
+const SCHEMA_VERSION: i32 = 1;
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -45,6 +48,21 @@ pub async fn ensure_postgres_database(cfg: &DatabaseConfig) -> Result<(), String
 }
 
 pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
+    // Fast path: if schema_migrations records the current version, skip everything.
+    sqlx::query("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
+        .execute(pool)
+        .await?;
+    let applied: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version >= {}",
+        SCHEMA_VERSION
+    ))
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    if applied > 0 {
+        return Ok(());
+    }
+
     let schema = if driver == "sqlite" {
         SQLITE_SCHEMA
     } else {
@@ -57,104 +75,8 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         }
         sqlx::query(stmt).execute(pool).await?;
     }
-    // 增量迁移 — use correct PG types for TIMESTAMPTZ / JSONB columns
-    let ts_type = if driver == "sqlite" { "TEXT" } else { "TIMESTAMPTZ" };
-    let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
 
-    sqlx::query("ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query(&format!(
-        "ALTER TABLE accounts ADD COLUMN usage_data {} NOT NULL DEFAULT '{{}}'",
-        json_type
-    ))
-    .execute(pool)
-    .await
-    .ok();
-    sqlx::query(&format!(
-        "ALTER TABLE accounts ADD COLUMN usage_fetched_at {}",
-        ts_type
-    ))
-    .execute(pool)
-    .await
-    .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'setup_token'")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN access_token TEXT NOT NULL DEFAULT ''")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query(&format!(
-        "ALTER TABLE accounts ADD COLUMN oauth_expires_at {}",
-        ts_type
-    ))
-    .execute(pool)
-    .await
-    .ok();
-    sqlx::query(&format!(
-        "ALTER TABLE accounts ADD COLUMN oauth_refreshed_at {}",
-        ts_type
-    ))
-    .execute(pool)
-    .await
-    .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN auth_error TEXT NOT NULL DEFAULT ''")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN account_uuid TEXT")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN organization_uuid TEXT")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN subscription_type TEXT")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN disable_reason TEXT NOT NULL DEFAULT ''")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN auto_telemetry INTEGER NOT NULL DEFAULT 0")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE accounts ADD COLUMN telemetry_count INTEGER NOT NULL DEFAULT 0")
-        .execute(pool)
-        .await
-        .ok();
-
-    // Fix column types for existing PG databases that may have TEXT instead of TIMESTAMPTZ/JSONB
-    if driver != "sqlite" {
-        sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB")
-            .execute(pool)
-            .await
-            .ok();
-        sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_fetched_at TYPE TIMESTAMPTZ USING usage_fetched_at::TIMESTAMPTZ")
-            .execute(pool)
-            .await
-            .ok();
-        sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_expires_at TYPE TIMESTAMPTZ USING oauth_expires_at::TIMESTAMPTZ")
-            .execute(pool)
-            .await
-            .ok();
-        sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_refreshed_at TYPE TIMESTAMPTZ USING oauth_refreshed_at::TIMESTAMPTZ")
-            .execute(pool)
-            .await
-            .ok();
-    }
-
-    // api_tokens 表
+    // api_tokens 表 — create before column-existence probing so both tables are present.
     let token_schema = if driver == "sqlite" {
         SQLITE_TOKENS_SCHEMA
     } else {
@@ -167,7 +89,164 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         }
         sqlx::query(stmt).execute(pool).await?;
     }
+
+    // 增量迁移 — only ALTER columns that are actually missing, so remote-DB startups
+    // don't pay ~20 round-trips for ALTERs that would otherwise fail with "column
+    // already exists" and get swallowed by .ok().
+    let ts_type = if driver == "sqlite" { "TEXT" } else { "TIMESTAMPTZ" };
+    let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
+    let cols = existing_columns(pool, driver, "accounts").await;
+
+    let pending: [(&str, String); 15] = [
+        (
+            "billing_mode",
+            "ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'".into(),
+        ),
+        (
+            "usage_data",
+            format!("ALTER TABLE accounts ADD COLUMN usage_data {} NOT NULL DEFAULT '{{}}'", json_type),
+        ),
+        (
+            "usage_fetched_at",
+            format!("ALTER TABLE accounts ADD COLUMN usage_fetched_at {}", ts_type),
+        ),
+        (
+            "auth_type",
+            "ALTER TABLE accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'setup_token'".into(),
+        ),
+        (
+            "access_token",
+            "ALTER TABLE accounts ADD COLUMN access_token TEXT NOT NULL DEFAULT ''".into(),
+        ),
+        (
+            "refresh_token",
+            "ALTER TABLE accounts ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''".into(),
+        ),
+        (
+            "oauth_expires_at",
+            format!("ALTER TABLE accounts ADD COLUMN oauth_expires_at {}", ts_type),
+        ),
+        (
+            "oauth_refreshed_at",
+            format!("ALTER TABLE accounts ADD COLUMN oauth_refreshed_at {}", ts_type),
+        ),
+        (
+            "auth_error",
+            "ALTER TABLE accounts ADD COLUMN auth_error TEXT NOT NULL DEFAULT ''".into(),
+        ),
+        (
+            "account_uuid",
+            "ALTER TABLE accounts ADD COLUMN account_uuid TEXT".into(),
+        ),
+        (
+            "organization_uuid",
+            "ALTER TABLE accounts ADD COLUMN organization_uuid TEXT".into(),
+        ),
+        (
+            "subscription_type",
+            "ALTER TABLE accounts ADD COLUMN subscription_type TEXT".into(),
+        ),
+        (
+            "disable_reason",
+            "ALTER TABLE accounts ADD COLUMN disable_reason TEXT NOT NULL DEFAULT ''".into(),
+        ),
+        (
+            "auto_telemetry",
+            "ALTER TABLE accounts ADD COLUMN auto_telemetry INTEGER NOT NULL DEFAULT 0".into(),
+        ),
+        (
+            "telemetry_count",
+            "ALTER TABLE accounts ADD COLUMN telemetry_count INTEGER NOT NULL DEFAULT 0".into(),
+        ),
+    ];
+    for (name, sql) in pending.iter() {
+        if !cols.contains(*name) {
+            sqlx::query(sql).execute(pool).await.ok();
+        }
+    }
+
+    // Fix column types for existing PG databases that may have TEXT instead of TIMESTAMPTZ/JSONB.
+    // Only run when the current data_type doesn't already match.
+    if driver != "sqlite" {
+        let types = column_types(pool, "accounts").await;
+        let needs_type = |col: &str, want: &str| {
+            types
+                .get(col)
+                .map(|t| !t.eq_ignore_ascii_case(want))
+                .unwrap_or(false)
+        };
+        if needs_type("usage_data", "jsonb") {
+            sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB")
+                .execute(pool)
+                .await
+                .ok();
+        }
+        if needs_type("usage_fetched_at", "timestamp with time zone") {
+            sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_fetched_at TYPE TIMESTAMPTZ USING usage_fetched_at::TIMESTAMPTZ")
+                .execute(pool)
+                .await
+                .ok();
+        }
+        if needs_type("oauth_expires_at", "timestamp with time zone") {
+            sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_expires_at TYPE TIMESTAMPTZ USING oauth_expires_at::TIMESTAMPTZ")
+                .execute(pool)
+                .await
+                .ok();
+        }
+        if needs_type("oauth_refreshed_at", "timestamp with time zone") {
+            sqlx::query("ALTER TABLE accounts ALTER COLUMN oauth_refreshed_at TYPE TIMESTAMPTZ USING oauth_refreshed_at::TIMESTAMPTZ")
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    // Stamp the version last so a partial failure above causes a clean retry next boot.
+    sqlx::query(&format!(
+        "INSERT INTO schema_migrations (version) VALUES ({}) ON CONFLICT DO NOTHING",
+        SCHEMA_VERSION
+    ))
+    .execute(pool)
+    .await
+    .ok();
+
     Ok(())
+}
+
+async fn existing_columns(pool: &AnyPool, driver: &str, table: &str) -> HashSet<String> {
+    let sql = if driver == "sqlite" {
+        format!(
+            "SELECT name FROM pragma_table_info('{}')",
+            table.replace('\'', "''")
+        )
+    } else {
+        format!(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = '{}'",
+            table.replace('\'', "''")
+        )
+    };
+    sqlx::query_scalar::<_, String>(&sql)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+async fn column_types(pool: &AnyPool, table: &str) -> std::collections::HashMap<String, String> {
+    let sql = format!(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = '{}'",
+        table.replace('\'', "''")
+    );
+    match sqlx::query_as::<_, (String, String)>(&sql)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(_) => std::collections::HashMap::new(),
+    }
 }
 
 const SQLITE_SCHEMA: &str = r#"
