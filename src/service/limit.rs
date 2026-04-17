@@ -315,7 +315,16 @@ impl LimitStore {
 /// 返回 `None` 表示本次响应无可吸取信息（保持内存原样）；
 /// 返回 `Some(new_state)` 表示调用者应把内存替换为该状态。
 fn compute_new_state(prev: &LimitState, status: u16, headers: &HeaderMap) -> Option<LimitState> {
-    let parsed_unified = parse_unified_headers(headers);
+    let parsed_unified = parse_unified_headers(headers).map(|mut p| {
+        // Sonnet 旁路：429 + representative-claim=seven_day_sonnet 时，
+        // 不把全局 status=Rejected 写入内存热态。这样 judge_availability 不会拉黑账号，
+        // 保留账号对 Opus / 5h/7d 聚合等其它模型/窗口的调度能力。
+        // 其它字段（5h/7d util、reset、claim、overage）继续吸收，UI/日志仍完整。
+        if status == 429 && p.representative_claim.as_deref() == Some("seven_day_sonnet") {
+            p.status = None;
+        }
+        p
+    });
     let parsed_rpm_tpm = parse_rpm_tpm_headers(headers);
     let retry_after = parse_retry_after(headers);
 
@@ -376,6 +385,13 @@ impl ParsedHeaders {
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// 判定响应是否为 Sonnet 周限流（`representative-claim == "seven_day_sonnet"`）。
+/// gateway 在 429 分流时使用：命中时直接透传，不 retry / 不拉黑账号。
+pub fn is_sonnet_rejection(headers: &HeaderMap) -> bool {
+    header_str(headers, "anthropic-ratelimit-unified-representative-claim")
+        == Some("seven_day_sonnet")
 }
 
 fn parse_unified_headers(headers: &HeaderMap) -> Option<ParsedHeaders> {
@@ -1484,5 +1500,127 @@ mod tests {
         let req = rt.get("requests").expect("has requests");
         assert_eq!(req.get("limit").and_then(|v| v.as_i64()), Some(50));
         assert_eq!(req.get("remaining").and_then(|v| v.as_i64()), Some(48));
+    }
+
+    // ---- Sonnet 旁路（Phase 5）----
+
+    fn reset_future_unix() -> String {
+        (Utc::now().timestamp() + 3600).to_string()
+    }
+
+    /// 429 + representative-claim=seven_day_sonnet → status 不应被设为 Rejected，
+    /// 账号 availability 保持 Available（不影响 Opus 调度）。
+    #[test]
+    fn absorb_429_sonnet_claim_does_not_set_rejected() {
+        let r = reset_future_unix();
+        let h = make_headers(&[
+            ("anthropic-ratelimit-unified-5h-reset", &r),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.50"),
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", &r),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_sonnet",
+            ),
+        ]);
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        // 关键：全局 status 不应被设为 Rejected
+        assert_ne!(new.status, Some(UnifiedStatus::Rejected));
+        // representative_claim 仍被吸收（UI 要用）
+        assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
+        // availability 保持 Available（5h util 0.50 远低于 97%，无其它拉黑条件）
+        assert!(judge_availability(&new).is_available());
+    }
+
+    /// 429 + representative-claim=seven_day_opus → 保持既有拉黑行为（Opus 覆盖所有 Opus 请求）。
+    #[test]
+    fn absorb_429_opus_claim_still_rejects() {
+        let r = reset_future_unix();
+        let h = make_headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", &r),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_opus",
+            ),
+        ]);
+        let prev = LimitState::default();
+        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        assert_eq!(new.status, Some(UnifiedStatus::Rejected));
+        assert!(!judge_availability(&new).is_available());
+    }
+
+    /// 429 + representative-claim=seven_day（聚合周）→ 保持既有拉黑。
+    #[test]
+    fn absorb_429_seven_day_aggregate_still_rejects() {
+        let r = reset_future_unix();
+        let h = make_headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", &r),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day",
+            ),
+        ]);
+        let new = compute_new_state(&LimitState::default(), 429, &h).expect("state");
+        assert_eq!(new.status, Some(UnifiedStatus::Rejected));
+        assert!(!judge_availability(&new).is_available());
+    }
+
+    /// 429 + representative-claim=five_hour → 保持既有拉黑。
+    #[test]
+    fn absorb_429_five_hour_claim_still_rejects() {
+        let r = reset_future_unix();
+        let h = make_headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", &r),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+        ]);
+        let new = compute_new_state(&LimitState::default(), 429, &h).expect("state");
+        assert_eq!(new.status, Some(UnifiedStatus::Rejected));
+        assert!(!judge_availability(&new).is_available());
+    }
+
+    /// 200 + representative-claim=seven_day_sonnet（正常响应含 Sonnet hint）→ 不触发旁路。
+    /// 该场景下 status=Allowed/Warning 本就不会拉黑，但确认我们没有错误地把 status 清成 None。
+    #[test]
+    fn absorb_200_sonnet_claim_keeps_status_allowed() {
+        let h = make_headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed_warning"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_sonnet",
+            ),
+        ]);
+        let new = compute_new_state(&LimitState::default(), 200, &h).expect("state");
+        // 200 不触发旁路；status 正常吸收
+        assert_eq!(new.status, Some(UnifiedStatus::AllowedWarning));
+    }
+
+    #[test]
+    fn is_sonnet_rejection_detects_header() {
+        let h = make_headers(&[(
+            "anthropic-ratelimit-unified-representative-claim",
+            "seven_day_sonnet",
+        )]);
+        assert!(is_sonnet_rejection(&h));
+    }
+
+    #[test]
+    fn is_sonnet_rejection_false_for_other_claims() {
+        for claim in ["seven_day_opus", "seven_day", "five_hour"] {
+            let h = make_headers(&[(
+                "anthropic-ratelimit-unified-representative-claim",
+                claim,
+            )]);
+            assert!(!is_sonnet_rejection(&h), "claim={} should not match", claim);
+        }
+        let h_empty = make_headers(&[]);
+        assert!(!is_sonnet_rejection(&h_empty));
     }
 }

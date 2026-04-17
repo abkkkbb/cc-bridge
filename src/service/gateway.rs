@@ -7,7 +7,7 @@ use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
@@ -156,144 +156,142 @@ impl GatewayService {
             (vec![], vec![])
         };
 
-        // 429 自动换号重试循环
-        let mut exclude_ids = blocked_ids.clone();
-        let mut last_resp: Option<Response> = None;
+        // 黏性透传策略：429 不再 retry 其它账号（换号会 bust prompt cache，成本爆炸）。
+        // 本次请求拿到 429 → 包装成通用错误 body 返回；后续并发请求由 absorb_headers
+        // 更新的 state.status / rate_limited_until 让 selector 自然避开此账号。
+        let account = match self
+            .account_svc
+            .select_account(&session_hash, &blocked_ids, &allowed_ids)
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "no available account: {}",
+                    e
+                )));
+            }
+        };
 
-        loop {
-            let attempt = exclude_ids.len().saturating_sub(blocked_ids.len());
-            // 选择账号
-            let account = match self
-                .account_svc
-                .select_account(&session_hash, &exclude_ids, &allowed_ids)
-                .await
-            {
-                Ok(a) => a,
-                Err(_) if last_resp.is_some() => {
-                    // 无可用账号但有上一次的 429 响应，返回给客户端
-                    return Ok(last_resp.unwrap());
-                }
-                Err(e) => {
-                    return Err(AppError::ServiceUnavailable(format!(
-                        "no available account: {}",
-                        e
-                    )));
-                }
+        // 自动遥测：拦截遥测请求 + 激活会话
+        if account.auto_telemetry {
+            use crate::service::telemetry::{
+                fake_metrics_enabled_response, fake_telemetry_response, is_telemetry_path,
             };
 
-            if attempt > 0 {
-                warn!("429 retry attempt {} with account {}", attempt, account.id);
-            }
-
-            // 自动遥测：拦截遥测请求 + 激活会话
-            if account.auto_telemetry {
-                use crate::service::telemetry::{
-                    fake_metrics_enabled_response, fake_telemetry_response, is_telemetry_path,
+            if is_telemetry_path(&path) {
+                let body = if path.contains("/metrics_enabled") {
+                    fake_metrics_enabled_response()
+                } else {
+                    fake_telemetry_response()
                 };
-
-                if is_telemetry_path(&path) {
-                    let body = if path.contains("/metrics_enabled") {
-                        fake_metrics_enabled_response()
-                    } else {
-                        fake_telemetry_response()
-                    };
-                    debug!("telemetry: intercepted {} for account {}", path, account.id);
-                    return Ok(axum::Json(body).into_response());
-                }
-
-                if path.starts_with("/v1/messages") {
-                    let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
-                    self.telemetry_svc
-                        .activate_session(&account, model_id)
-                        .await;
-                }
+                debug!("telemetry: intercepted {} for account {}", path, account.id);
+                return Ok(axum::Json(body).into_response());
             }
 
-            // 获取并发槽位
-            let acquired = self
-                .account_svc
-                .acquire_slot(account.id, account.concurrency)
-                .await
-                .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
-            if !acquired {
-                return Err(AppError::TooManyRequests(
-                    "concurrency slot unavailable".into(),
-                ));
+            if path.starts_with("/v1/messages") {
+                let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
+                self.telemetry_svc
+                    .activate_session(&account, model_id)
+                    .await;
             }
-
-            // 用 SlotHolder 承载槽位所有权：
-            // - 成功响应：move 进 SlotHeldStream，随 body 流结束/中断才释放
-            // - 429 重试：SlotHolder 随旧 last_resp 被覆盖而 drop，自动释放
-            // - 客户端断开：axum drop response body → drop SlotHolder → 释放
-            let slot = self.account_svc.slot_holder_for(account.id);
-
-            // 改写请求体
-            debug!(
-                "request body BEFORE rewrite: {}",
-                truncate_body(&body_bytes, 4096)
-            );
-            let rewritten_body =
-                self.rewriter
-                    .rewrite_body(&body_bytes, &path, &account, client_type);
-            debug!(
-                "request body AFTER rewrite: {}",
-                truncate_body(&rewritten_body, 4096)
-            );
-
-            // 重新解析改写后的 body
-            let mut rewritten_body_map: serde_json::Value =
-                serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
-
-            // 改写 header
-            let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
-            let rewritten_headers = self.rewriter.rewrite_headers(
-                &headers,
-                &account,
-                client_type,
-                model_id,
-                &rewritten_body_map,
-            );
-
-            // 清理 body 中的 _session_id 标记并重新序列化
-            let final_body = if client_type == ClientType::API {
-                clean_session_id_from_body(&mut rewritten_body_map);
-                serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
-            } else {
-                rewritten_body.clone()
-            };
-
-            let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
-            let mut final_headers = rewritten_headers;
-            final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
-
-            // 转发到上游（SlotHolder 所有权移交给响应流）
-            let resp = self
-                .forward_request(
-                    &method.to_string(),
-                    &path,
-                    &query,
-                    &final_headers,
-                    &final_body,
-                    &account,
-                    slot,
-                )
-                .await?;
-
-            // 非 429 直接返回
-            if resp.status() != StatusCode::TOO_MANY_REQUESTS {
-                return Ok(resp);
-            }
-
-            // 429：排除该账号，尝试下一个。
-            // SlotHolder 已随 resp 移交：被覆盖的旧 last_resp 会 drop → 自动释放旧账号的槽。
-            warn!(
-                "account {} returned 429, excluding and retrying (attempt {})",
-                account.id,
-                attempt + 1,
-            );
-            exclude_ids.push(account.id);
-            last_resp = Some(resp);
         }
+
+        // 获取并发槽位
+        let acquired = self
+            .account_svc
+            .acquire_slot(account.id, account.concurrency)
+            .await
+            .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
+        if !acquired {
+            return Err(AppError::TooManyRequests(
+                "concurrency slot unavailable".into(),
+            ));
+        }
+
+        // SlotHolder 承载槽位所有权：SlotHeldStream 随 body 流结束/中断才释放；
+        // 429 包装时原 resp 被 drop → SlotHolder 也被 drop → 自动释放。
+        let slot = self.account_svc.slot_holder_for(account.id);
+
+        // 改写请求体
+        debug!(
+            "request body BEFORE rewrite: {}",
+            truncate_body(&body_bytes, 4096)
+        );
+        let rewritten_body =
+            self.rewriter
+                .rewrite_body(&body_bytes, &path, &account, client_type);
+        debug!(
+            "request body AFTER rewrite: {}",
+            truncate_body(&rewritten_body, 4096)
+        );
+
+        let mut rewritten_body_map: serde_json::Value =
+            serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
+
+        let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
+        let rewritten_headers = self.rewriter.rewrite_headers(
+            &headers,
+            &account,
+            client_type,
+            model_id,
+            &rewritten_body_map,
+        );
+
+        let final_body = if client_type == ClientType::API {
+            clean_session_id_from_body(&mut rewritten_body_map);
+            serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
+        } else {
+            rewritten_body.clone()
+        };
+
+        let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
+        let mut final_headers = rewritten_headers;
+        final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+
+        let resp = self
+            .forward_request(
+                &method.to_string(),
+                &path,
+                &query,
+                &final_headers,
+                &final_body,
+                &account,
+                slot,
+            )
+            .await?;
+
+        let status = resp.status();
+
+        // 5xx 黏性透传：wrap body 为通用 api_error，剥离请求追踪头。
+        // 避免把上游堆栈 / 请求 ID / 基础设施信息泄漏给下游客户端。
+        if status.is_server_error() {
+            warn!(
+                "account {} returned {} (wrapped, no retry)",
+                account.id,
+                status.as_u16()
+            );
+            return Ok(wrap_5xx_response(resp));
+        }
+
+        if status != StatusCode::TOO_MANY_REQUESTS {
+            return Ok(resp);
+        }
+
+        // 429 黏性透传：不切号、不 retry，把原 body 替换为通用文案后返回给客户端。
+        // absorb_headers 已在 forward_request 里执行，state 更新后续请求会自动避开。
+        if crate::service::limit::is_sonnet_rejection(resp.headers()) {
+            info!(
+                "account {} returned 429 for sonnet quota (sticky, no retry)",
+                account.id
+            );
+        } else {
+            warn!(
+                "account {} returned 429 (sticky, no retry)",
+                account.id
+            );
+        }
+        Ok(wrap_429_response(resp))
     }
 
     async fn forward_request(
@@ -423,6 +421,73 @@ const GATEWAY_HEADER_PREFIXES: &[&str] = &[
 fn is_gateway_fingerprint_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     GATEWAY_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// 黏性透传策略下，把上游 429 响应包装成 Anthropic 标准格式的通用文案，
+/// 避免把具体的限流窗口 / 剩余额度 / 订阅等级等内部细节泄漏给下游客户端。
+///
+/// - status 保留 429
+/// - body 替换为 GENERIC_429_BODY
+/// - content-type 固定 application/json；content-length 由 body 自动计算，跳过原值
+/// - 其它响应头原样保留（包括 `retry-after` 给客户端参考、以及 `anthropic-ratelimit-*` 系列）
+fn wrap_429_response(resp: Response) -> Response {
+    const GENERIC_429_BODY: &str = concat!(
+        r#"{"type":"error","error":{"type":"rate_limit_error","#,
+        r#""message":"Rate limit reached, please retry shortly."}}"#,
+    );
+
+    let status = resp.status();
+    let mut builder = Response::builder().status(status);
+    for (k, v) in resp.headers() {
+        // content-length / content-type 会被新 body 覆盖；跳过避免冲突
+        if matches!(k.as_str(), "content-length" | "content-type") {
+            continue;
+        }
+        builder = builder.header(k.clone(), v.clone());
+    }
+    builder = builder.header("content-type", "application/json");
+    builder
+        .body(Body::from(GENERIC_429_BODY))
+        .unwrap_or_else(|_| {
+            (StatusCode::TOO_MANY_REQUESTS, GENERIC_429_BODY).into_response()
+        })
+}
+
+/// 5xx 黏性透传策略：把上游的 500-599 响应包装成 Anthropic 格式的通用 api_error。
+///
+/// 原 body 可能包含堆栈 / 内部路径 / SSE 错误帧；原 header 可能含请求追踪信息
+/// （`x-request-id` / `cf-ray` 能定位到上游内部的具体请求）。统一过滤掉，下游只看到
+/// 一个干净的"上游错误，请稍后重试"。
+///
+/// - status 保留上游原值（500 / 502 / 503 / 504 / 529 等）
+/// - body 替换为 GENERIC_5XX_BODY
+/// - 剥离：`x-request-id` / `request-id` / `cf-ray` / `server` / `via`
+/// - content-type 固定 application/json；content-length 由新 body 自动计算
+fn wrap_5xx_response(resp: Response) -> Response {
+    const GENERIC_5XX_BODY: &str = concat!(
+        r#"{"type":"error","error":{"type":"api_error","#,
+        r#""message":"Upstream error, please retry shortly."}}"#,
+    );
+
+    let status = resp.status();
+    let mut builder = Response::builder().status(status);
+    for (k, v) in resp.headers() {
+        let name_lower = k.as_str().to_ascii_lowercase();
+        if matches!(name_lower.as_str(), "content-length" | "content-type") {
+            continue;
+        }
+        if matches!(
+            name_lower.as_str(),
+            "x-request-id" | "request-id" | "cf-ray" | "server" | "via"
+        ) {
+            continue;
+        }
+        builder = builder.header(k.clone(), v.clone());
+    }
+    builder = builder.header("content-type", "application/json");
+    builder
+        .body(Body::from(GENERIC_5XX_BODY))
+        .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, GENERIC_5XX_BODY).into_response())
 }
 
 fn truncate_body(b: &[u8], max: usize) -> String {
@@ -905,6 +970,175 @@ mod tests {
         assert!(
             slot_is_free(&cache, key).await,
             "大批量并发 drop 后槽位应归零，没有泄漏/负数"
+        );
+    }
+
+    // -------------------- wrap_429_response --------------------
+
+    use axum::body::to_bytes;
+
+    fn make_429(headers: &[(&str, &str)], body: &[u8]) -> Response {
+        let mut builder = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(Body::from(body.to_vec())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn wrap_429_response_replaces_body_with_generic_json() {
+        let original = make_429(
+            &[("content-type", "application/json")],
+            br#"{"type":"error","error":{"type":"rate_limit_error","message":"You have hit your Sonnet limit"}}"#,
+        );
+        let wrapped = wrap_429_response(original);
+        assert_eq!(wrapped.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = to_bytes(wrapped.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("rate_limit_error"),
+            "通用文案应保留 rate_limit_error 类型: {}",
+            text
+        );
+        assert!(
+            text.contains("Rate limit reached"),
+            "应是通用文案: {}",
+            text
+        );
+        assert!(
+            !text.contains("Sonnet"),
+            "不应泄漏原 body 细节: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_429_response_drops_content_length_and_sets_json_ctype() {
+        // 原响应带错误的 content-length 和 text/html 类型 → 包装后应被覆盖为 application/json
+        let original = make_429(
+            &[
+                ("content-length", "999"),
+                ("content-type", "text/html"),
+            ],
+            b"<html>rate limited</html>",
+        );
+        let wrapped = wrap_429_response(original);
+        let ct = wrapped.headers().get("content-type").unwrap().to_str().unwrap();
+        assert_eq!(ct, "application/json");
+        // content-length 原值不应存在（axum 会按实际 body 重算或不设）
+        let cl_values: Vec<_> = wrapped.headers().get_all("content-length").iter().collect();
+        assert!(
+            cl_values.iter().all(|v| v.to_str().unwrap() != "999"),
+            "旧的 content-length=999 不应保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_429_response_preserves_retry_after_and_other_headers() {
+        let original = make_429(
+            &[
+                ("retry-after", "60"),
+                ("x-custom-debug", "abc"),
+                ("anthropic-ratelimit-unified-status", "rejected"),
+            ],
+            b"original body",
+        );
+        let wrapped = wrap_429_response(original);
+        assert_eq!(
+            wrapped.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+        assert_eq!(
+            wrapped.headers().get("x-custom-debug").and_then(|v| v.to_str().ok()),
+            Some("abc")
+        );
+        // anthropic-ratelimit-* 默认也保留（用户明确选了"body only"包装，不动 header）
+        assert_eq!(
+            wrapped
+                .headers()
+                .get("anthropic-ratelimit-unified-status")
+                .and_then(|v| v.to_str().ok()),
+            Some("rejected")
+        );
+    }
+
+    // -------------------- wrap_5xx_response --------------------
+
+    fn make_5xx(status: StatusCode, headers: &[(&str, &str)], body: &[u8]) -> Response {
+        let mut builder = Response::builder().status(status);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(Body::from(body.to_vec())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn wrap_5xx_response_replaces_body_with_generic_api_error() {
+        let original = make_5xx(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &[("content-type", "text/html")],
+            b"<html><body>Traceback (most recent call last):\n  File 'internal/core.py' ...</body></html>",
+        );
+        let wrapped = wrap_5xx_response(original);
+        assert_eq!(wrapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(wrapped.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("api_error"), "应包含 api_error type: {}", text);
+        assert!(text.contains("Upstream error"), "应是通用文案: {}", text);
+        assert!(!text.contains("Traceback"), "不应泄漏堆栈: {}", text);
+        assert!(!text.contains("core.py"), "不应泄漏内部路径: {}", text);
+    }
+
+    #[tokio::test]
+    async fn wrap_5xx_response_preserves_status_code() {
+        // 530 是 CloudFlare 的特殊状态，但 is_server_error 都能覆盖
+        for code in [500u16, 502, 503, 504, 529] {
+            let st = StatusCode::from_u16(code).unwrap();
+            let original = make_5xx(st, &[], b"x");
+            let wrapped = wrap_5xx_response(original);
+            assert_eq!(wrapped.status().as_u16(), code, "status {} 应保留", code);
+        }
+    }
+
+    #[tokio::test]
+    async fn wrap_5xx_response_strips_tracking_headers() {
+        let original = make_5xx(
+            StatusCode::BAD_GATEWAY,
+            &[
+                ("x-request-id", "req_abc_123"),
+                ("cf-ray", "8a2f1c9e7d5b2a4e-SJC"),
+                ("server", "cloudflare"),
+                ("via", "1.1 cloudflare"),
+                ("retry-after", "30"),
+                ("x-custom-debug", "keep-me"),
+            ],
+            b"origin error",
+        );
+        let wrapped = wrap_5xx_response(original);
+
+        // 追踪类 header 必须被剥离
+        for h in ["x-request-id", "cf-ray", "server", "via"] {
+            assert!(
+                wrapped.headers().get(h).is_none(),
+                "header {} 应被剥离",
+                h
+            );
+        }
+
+        // 其它非追踪 header 应保留
+        assert_eq!(
+            wrapped.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("30")
+        );
+        assert_eq!(
+            wrapped.headers().get("x-custom-debug").and_then(|v| v.to_str().ok()),
+            Some("keep-me")
+        );
+
+        // content-type 应是 application/json
+        assert_eq!(
+            wrapped.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json")
         );
     }
 }
