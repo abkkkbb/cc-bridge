@@ -95,8 +95,9 @@
 - 粘性会话 24h 绑定同一账号
 - 优先级调度 + 同优先级随机
 - 每账号独立并发上限
-- OAuth 按用量窗口智能限流 / 403 永久停用
-- 后台自动刷新用量，前端 60s 静默更新
+- 响应头驱动限流（OAuth: 5h/7d unified；SetupToken: RPM/TPM），实时更新内存热态 + 异步落盘
+- 403 永久停用 / 429 黏性透传（不切号，保全 prompt cache）
+- Admin 手动刷新用量（仅 OAuth）
 - 手动一键启停
 
 </td>
@@ -207,7 +208,6 @@ curl http://127.0.0.1:5674/v1/messages \
 | `TLS_KEY_FILE` | - | 私钥路径 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `ADMIN_PASSWORD` | `admin` | 管理后台密码 |
-| `USAGE_POLL_INTERVAL_SECS` | `300` | OAuth 账号用量后台自动刷新间隔（秒） |
 
 ### 数据库
 
@@ -256,7 +256,6 @@ SERVER_HOST=0.0.0.0
 SERVER_PORT=5674
 LOG_LEVEL=info
 ADMIN_PASSWORD=change-this-admin-password
-USAGE_POLL_INTERVAL_SECS=300
 
 # --- postgres ---
 DATABASE_DRIVER=postgres
@@ -434,7 +433,18 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 
 ### 错误响应
 
-统一格式 `{"error": "..."}`，常见状态码：`400` / `401` / `404` / `429` / `502` / `503` / `500`。
+**管理接口**统一格式 `{"error": "..."}`，常见状态码：`400` / `401` / `404` / `429` / `502` / `503` / `500`。
+
+**网关转发**在上游返回异常时的包装规则：
+
+| 上游状态 | 透传/包装 | 响应 body |
+|---|---|---|
+| 2xx / 3xx / 4xx（非 429 / 非 403） | 原样透传 | 上游原 body |
+| 403 | 原样透传 + 账号永久停用 | 上游原 body |
+| **429** | 状态码保留、body 通用化 | `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit reached, please retry shortly."}}` |
+| **5xx**（500/502/503/504/529 等） | 状态码保留、body 通用化 + 剥离追踪头 | `{"type":"error","error":{"type":"api_error","message":"Upstream error, please retry shortly."}}` |
+
+5xx 包装时剥离的 header：`x-request-id` / `request-id` / `cf-ray` / `server` / `via`。429 包装只换 body，`retry-after` 等 header 保留供客户端参考。
 
 ---
 
@@ -519,7 +529,7 @@ cc-bridge/
 │   ├── handler/             # 路由与 HTTP handler
 │   ├── middleware/          # 鉴权中间件
 │   ├── model/               # Account / ApiToken / Identity 模型
-│   ├── service/             # Gateway / Account / OAuth / Telemetry / Rewriter
+│   ├── service/             # Gateway / Account / Limit / OAuth / Telemetry / Rewriter
 │   ├── store/               # 数据库与缓存访问层
 │   └── tlsfp/               # TLS 指纹客户端
 ├── web/                     # Vue 3 前端
@@ -562,6 +572,9 @@ cc-bridge/
 | 5 | 多实例需 Redis | 否则会话粘性和并发计数无法跨实例共享 |
 | 6 | 版本号硬编码 | identity 模块中的版本号为静态值，上游更新后需手动同步 |
 | 7 | Datadog 遥测无法拦截 | 客户端直连发送，建议网络层屏蔽 |
+| 8 | 429 不自动换号 | 黏性优先（保 prompt cache），客户端需自行重试；并发/后续请求会自动避开受限账号 |
+| 9 | 重启后限流内存清空 | 重启后各账号 `LimitState` 清零，首个请求重新从响应头学习（首次响应后 `first-fill` 立即落盘） |
+| 10 | per-model Opus/Sonnet 窗口无响应头 | Sonnet/Opus 独立窗口 util 只在 `/api/oauth/usage` JSON 里，响应头仅 `representative-claim` 字符串 |
 
 ---
 
@@ -599,40 +612,63 @@ cc-bridge/
 
 每账号 `concurrency` 上限，请求命中后抢占槽位，失败返回 429。槽位请求结束后自动释放。
 
-### 限速与停用
+### 限速与账号调度
 
-网关根据账号类型对上游 `429` 采取不同策略，避免把仍有额度的账号长时间挂起。
+网关不主动查询用量，而是**每次转发完 `/v1/messages` 请求后从上游响应头吸取限流状态到内存热态**（`src/service/limit.rs` 的 `LimitStore`），按 5 分钟 TTL + 紧急事件异步落盘到 `usage_data` JSON。selector 只读内存，纳秒级查询。
 
-**SetupToken 账号**（无法查询用量接口，保守处理）：
+**OAuth 账号**（响应头含 `anthropic-ratelimit-unified-*`）：
 
-| 上游状态码 | 行为 | 持续时间 |
-|-----------|------|---------|
-| `429` | 暂停调度（状态保持 active） | 5 小时自动恢复 |
-| `403` | 永久停用（标记 disabled） | 手动启用 |
+| 字段 | 用途 |
+|---|---|
+| `unified-5h-utilization` / `unified-5h-reset` | 5 小时滚动窗口用量（0.0–1.0） + 重置 Unix 时刻 |
+| `unified-7d-utilization` / `unified-7d-reset` | 7 天滚动窗口 |
+| `unified-status` | `allowed` / `allowed_warning` / `rejected` |
+| `unified-representative-claim` | 瓶颈窗口字符串（`five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet`） |
+| `unified-overage-status` / `unified-overage-reset` | 超量付费窗口 |
+| `unified-fallback-percentage` | 回退配额 |
 
-**OAuth 账号**（收到 `429` 后立即调用 `/api/oauth/usage` 判断实际触发的限额窗口）：
+任一窗口 `utilization >= 97%` 或 `unified-status == rejected` → 账号被 selector 判 Unavailable，直到 reset 时刻自动恢复。
 
-| 触发场景 | 判定条件 | 恢复时间 |
-|---------|---------|---------|
-| 7 天限额撞墙 | `seven_day.utilization >= 97%` | 到 `seven_day.resets_at` |
-| 5 小时限额撞墙 | `five_hour.utilization >= 97%` | 到 `five_hour.resets_at` |
-| 纯速率限制 | 两个窗口都未达阈值 | 1 分钟短冷却 |
-| 用量查询失败 | 网络 / 认证异常 | 5 小时保守回退 |
-| `403` | 认证失败 | 永久停用（手动启用） |
+**SetupToken 账号**（响应头含 `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-*`）：
 
-同时命中两个窗口时优先 7 天（限流更久）。Sonnet 周限额（`seven_day_sonnet`）暂不纳入判断。阈值在 `src/service/account.rs` 的 `USAGE_HIT_THRESHOLD` 常量中可调整。
+| 字段 | 用途 |
+|---|---|
+| `requests-{limit,remaining,reset}` | RPM（每分钟请求数） |
+| `tokens-{limit,remaining,reset}` | 总 TPM（"最严限制"） |
+| `input-tokens-*` / `output-tokens-*` | 输入/输出 TPM |
 
-> 429 期间再收到 403 不会触发永久停用，避免误判。
+任一 counter `remaining / limit < 3%` 且 reset 未到 → 预抢拉黑，避免并发 burst 撞墙。reset 格式为 RFC 3339（非 Unix 秒）。
 
-### 自动换号重试
+**CF-layer 429**（响应头无 `anthropic-ratelimit-*`，通常是 CloudFlare 直出或容量问题）：
+设短期隔离 `now + retry-after`，缺 `retry-after` 时默认 60 秒。自动恢复。
 
-收到 429 后网关会把当前账号加入本次请求的排除列表，从可调度账号中重新选号继续尝试，直到成功或无可用账号。客户端只看到最终结果，中间切换对其透明。
+**403** 命中 → 账号永久停用（`disabled`），需管理后台手动重新启用。
 
-### 用量数据自动刷新
+### 429 黏性透传策略
 
-- **后台轮询**：启动时 spawn 一个任务，每 `USAGE_POLL_INTERVAL_SECS`（默认 300 秒）遍历所有 active 的 OAuth 账号，调用 Anthropic `/api/oauth/usage` 更新 `usage_data` 字段。账号之间 500ms 间隔，避免瞬时并发过高。
-- **前端静默重载**：Accounts 页面打开时每 60 秒重新拉取账号列表，从本地数据库读取最新用量。页面切走后 `onUnmounted` 清理定时器。
-- **手动刷新按钮**：点击"用量"按钮仍可立即刷新单个账号的用量数据。
+收到上游 429 后，网关**不再切号 retry**（换账号会 bust prompt cache，每次请求成本显著上升）。行为：
+
+1. `absorb_headers` 更新内存 `state.status` / `rate_limited_until`，后续并发/新请求的 selector 会自动避开本账号
+2. 当前请求的 body 替换为标准 Anthropic 格式的通用文案：`{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit reached, please retry shortly."}}`
+3. 状态码保留 429；`retry-after` 等响应头保留供客户端参考
+4. 下放重试决策给客户端 / 用户（Claude Code 等 SDK 自带退避逻辑）
+
+**Sonnet 周限流特例**：`representative-claim == seven_day_sonnet` 的 429 **不**把账号标为 Unavailable（Sonnet 耗尽不影响 Opus），Opus 请求在同账号上继续可用，但仍透传 429 body 给本次 Sonnet 请求。
+
+### 5xx 黏性包装
+
+上游返回 5xx（500 / 502 / 503 / 504 / 529 等）时，网关：
+
+1. 状态码原样保留
+2. body 替换为 `{"type":"error","error":{"type":"api_error","message":"Upstream error, please retry shortly."}}`
+3. 剥离追踪/基础设施头：`x-request-id` / `request-id` / `cf-ray` / `server` / `via`
+4. 其它头（`retry-after` 等）保留
+
+防止上游堆栈 / 请求 ID / 节点 ID 泄漏给下游客户端。
+
+### 用量刷新
+
+`POST /admin/accounts/:id/usage` 主动调 Anthropic `/api/oauth/usage`（**仅 OAuth 账号**；SetupToken 返回用户友好错误）。60 秒 DB 级去抖动。结果写入 `usage_data` 并同步到 `LimitStore` 内存热态。前端 Accounts 页面打开期间每 60 秒重新拉账号列表，从 DB 读取最新 `usage_data` 和 `rate_limit_reset_at` 显示进度条。**无后台定时 poller**（Phase 1.5 已移除 `USAGE_POLL_INTERVAL_SECS`）。
 
 ### 请求头改写
 
@@ -681,8 +717,8 @@ cc-bridge/
 | `billing_mode` | `strip` / `rewrite` |
 | `account_uuid` / `organization_uuid` / `subscription_type` | 遥测改写用 |
 | `concurrency` / `priority` | 调度参数 |
-| `rate_limited_at` / `rate_limit_reset_at` / `disable_reason` | 限流/停用状态 |
-| `usage_data` / `usage_fetched_at` | 用量缓存 |
+| `rate_limited_at` / `rate_limit_reset_at` / `disable_reason` | 限流/停用状态（响应头驱动异步落盘） |
+| `usage_data` / `usage_fetched_at` | 限流 JSON 快照（含 `five_hour` / `seven_day` / `rpm_tpm` / `source` 等字段） |
 | `auto_telemetry` / `telemetry_count` | 自动遥测 |
 
 ### `api_tokens` 表
