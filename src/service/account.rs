@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType};
+use crate::service::limit::LimitStore;
 use crate::service::rewriter::ClientType;
 use crate::store::account_store::AccountStore;
 use crate::store::cache::CacheStore;
@@ -29,15 +30,21 @@ const USAGE_429_COOLDOWN: Duration = Duration::from_secs(60);
 pub struct AccountService {
     store: Arc<AccountStore>,
     cache: Arc<dyn CacheStore>,
+    limit_store: Arc<LimitStore>,
     /// 账号级 `/api/oauth/usage` 429 冷却（in-memory，重启即清空，无需持久化）。
     usage_cooldown: Mutex<HashMap<i64, Instant>>,
 }
 
 impl AccountService {
-    pub fn new(store: Arc<AccountStore>, cache: Arc<dyn CacheStore>) -> Self {
+    pub fn new(
+        store: Arc<AccountStore>,
+        cache: Arc<dyn CacheStore>,
+        limit_store: Arc<LimitStore>,
+    ) -> Self {
         Self {
             store,
             cache,
+            limit_store,
             usage_cooldown: Mutex::new(HashMap::new()),
         }
     }
@@ -137,6 +144,7 @@ impl AccountService {
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
+                            && self.limit_store.availability(account_id).is_available()
                         {
                             return Ok(account);
                         }
@@ -150,12 +158,13 @@ impl AccountService {
         // 获取可调度账号
         let accounts = self.store.list_schedulable().await?;
 
-        // 过滤：排除项 + 可用账号限制
+        // 过滤：排除项 + 可用账号限制 + 限流状态（内存热态）
         let candidates: Vec<Account> = accounts
             .into_iter()
             .filter(|a| {
                 !exclude_ids.contains(&a.id)
                     && (allowed_ids.is_empty() || allowed_ids.contains(&a.id))
+                    && self.limit_store.availability(a.id).is_available()
             })
             .collect();
 
@@ -247,6 +256,8 @@ impl AccountService {
             Ok(usage) => {
                 let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
                 self.store.update_usage(id, &usage_str).await?;
+                // 同步 LimitStore 内存热态，避免前端手动刷新数据与响应头数据互相覆盖
+                self.limit_store.ingest_usage_json(id, &usage);
                 info!("refresh_usage: account {} → upstream OK, cached", id);
                 Ok(usage)
             }

@@ -87,6 +87,7 @@ pub struct GatewayService {
     account_svc: Arc<AccountService>,
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
+    limit_store: Arc<crate::service::limit::LimitStore>,
 }
 
 impl GatewayService {
@@ -94,11 +95,13 @@ impl GatewayService {
         account_svc: Arc<AccountService>,
         rewriter: Arc<Rewriter>,
         telemetry_svc: Arc<TelemetryService>,
+        limit_store: Arc<crate::service::limit::LimitStore>,
     ) -> Self {
         Self {
             account_svc,
             rewriter,
             telemetry_svc,
+            limit_store,
         }
     }
 
@@ -354,6 +357,19 @@ impl GatewayService {
             } else {
                 warn!("account {} permanently disabled for 403", account.id);
             }
+        }
+
+        // 吸取限流响应头到内存热态；达到 TTL / 阈值等条件时异步 flush 到 DB。
+        // 这条路径对空闲账号不产生任何上游/磁盘开销——响应头没 unified-* 字段就直接跳过。
+        let should_flush = self.limit_store.absorb_headers(account.id, resp.headers());
+        if should_flush {
+            let ls = self.limit_store.clone();
+            let aid = account.id;
+            tokio::spawn(async move {
+                if let Err(e) = ls.flush_to_db(aid).await {
+                    warn!("limit flush failed for account {}: {}", aid, e);
+                }
+            });
         }
 
         // 构建响应

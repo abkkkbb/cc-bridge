@@ -72,9 +72,11 @@ async fn main() {
         driver.clone(),
     ));
 
+    let limit_store = Arc::new(service::limit::LimitStore::new(account_store.clone()));
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),
         cache.clone(),
+        limit_store.clone(),
     ));
     let rewriter = Arc::new(service::rewriter::Rewriter::new());
     let telemetry_svc = Arc::new(service::telemetry::TelemetryService::new(
@@ -85,6 +87,7 @@ async fn main() {
         account_svc.clone(),
         rewriter.clone(),
         telemetry_svc.clone(),
+        limit_store.clone(),
     ));
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
