@@ -49,7 +49,7 @@ impl TokenTester {
         let env: CanonicalEnvData =
             serde_json::from_value(canonical_env.clone()).unwrap_or_default();
         let version = if env.version.is_empty() {
-            "2.1.109"
+            crate::config::CLAUDE_CODE_VERSION
         } else {
             &env.version
         };
@@ -168,7 +168,10 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", "claude-code/2.1.109")
+        .header(
+            "User-Agent",
+            format!("claude-code/{}", crate::config::CLAUDE_CODE_VERSION),
+        )
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("usage request failed: {}", e)))?;

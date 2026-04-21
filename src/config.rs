@@ -1,6 +1,15 @@
 use std::env;
 use std::path::Path;
 
+/// 当前 gateway 模拟的 Claude Code CLI 版本号。所有出站 UA/identity/telemetry
+/// 的默认字面量都引用此常量。通过编译期环境变量 `CC_VERSION` 覆盖，例如：
+///     CC_VERSION=2.1.112 cargo build --release
+/// 升级只需改一处（不设 env 时）或重新构建（设 env 时）。
+pub const CLAUDE_CODE_VERSION: &str = match option_env!("CC_VERSION") {
+    Some(v) => v,
+    None => "2.1.109",
+};
+
 #[derive(Clone)]
 pub struct Config {
     pub server: ServerConfig,

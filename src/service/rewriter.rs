@@ -59,7 +59,7 @@ pub enum ClientType {
     API,
 }
 
-const DEFAULT_VERSION: &str = "2.1.109";
+const DEFAULT_VERSION: &str = crate::config::CLAUDE_CODE_VERSION;
 
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
 fn merge_anthropic_beta(required: &str, incoming: &str) -> String {

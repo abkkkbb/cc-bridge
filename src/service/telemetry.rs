@@ -435,7 +435,7 @@ async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
         .ok()
         .and_then(|a| serde_json::from_value::<CanonicalEnvData>(a.canonical_env).ok())
         .map(|e| e.version)
-        .unwrap_or_else(|| "2.1.109".into());
+        .unwrap_or_else(|| crate::config::CLAUDE_CODE_VERSION.into());
     format!("claude-code/{}", version)
 }
 
