@@ -2,7 +2,7 @@ name: Build & Release
 
 on:
   push:
-    branches: [ccb]
+    branches: [main]
     paths: ['.version']
   workflow_dispatch:
 
