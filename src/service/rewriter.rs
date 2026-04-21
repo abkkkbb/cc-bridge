@@ -259,6 +259,32 @@ impl Rewriter {
             out.entry("anthropic-dangerous-direct-browser-access".into())
                 .or_insert_with(|| "true".into());
 
+            // v2.1.109 标准 header 兜底：客户端未传时由 gateway 补齐，
+            // 让出站指纹独立于下游 CLI 版本（避免下游 v2.1.81 客户端导致缺字段）。
+            out.entry("Accept".into())
+                .or_insert_with(|| "application/json".into());
+            out.entry("anthropic-version".into())
+                .or_insert_with(|| "2023-06-01".into());
+            out.entry("accept-encoding".into())
+                .or_insert_with(|| "br, gzip, deflate".into());
+            out.entry("accept-language".into())
+                .or_insert_with(|| "*".into());
+            out.entry("sec-fetch-mode".into())
+                .or_insert_with(|| "cors".into());
+            out.entry("x-app".into())
+                .or_insert_with(|| "cli".into());
+            out.entry("X-Stainless-Retry-Count".into())
+                .or_insert_with(|| "0".into());
+            out.entry("X-Stainless-Timeout".into())
+                .or_insert_with(|| "600".into());
+            out.entry("X-Stainless-Lang".into())
+                .or_insert_with(|| "js".into());
+            out.entry("X-Claude-Code-Session-Id".into()).or_insert_with(|| {
+                extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid)
+            });
+            out.entry("x-client-request-id".into())
+                .or_insert_with(generate_session_uuid);
+
             // 合并客户端 beta 与必需 beta
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
             out.insert(
