@@ -59,6 +59,88 @@ pub enum ClientType {
     API,
 }
 
+/// 真实 Claude Code CLI 内部使用两种 HTTP client（Stainless SDK vs axios），
+/// 不同 endpoint 家族对应不同的 UA / accept / accept-encoding 模板。
+/// 按 path 分发到对应 profile 以匹配真实 CLI 流量指纹。
+///
+/// 证据：cc-reqable/*.har 抓包显示：
+///   - /v1/messages                       → Stainless: UA=claude-cli/X (external, cli), accept=application/json, accept-encoding="br, gzip, deflate"
+///   - /api/claude_code_grove             → axios + claude-cli UA 特例
+///   - /api/oauth/*, /api/event_logging,
+///     /api/claude_cli/bootstrap          → axios + claude-code/X UA
+///   - /v1/mcp_servers, /mcp-registry/*,
+///     /api/claude_code_penguin_mode      → bare axios/1.13.6
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpProfile {
+    /// Stainless fetch SDK（messages 核心路径）
+    Stainless,
+    /// axios + User-Agent="claude-cli/X.Y.Z (external, cli)"
+    AxiosClaudeCli,
+    /// axios + User-Agent="claude-code/X.Y.Z"
+    AxiosClaudeCode,
+    /// axios + User-Agent="axios/1.13.6"（裸库标识，无版本）
+    AxiosBare,
+}
+
+/// 根据 request path 决定真实 CLI 使用的 HTTP client profile。
+pub fn determine_http_profile(path: &str) -> HttpProfile {
+    // 裸 axios：用 axios/1.13.6 的 endpoint
+    if path.starts_with("/v1/mcp_servers")
+        || path.starts_with("/mcp-registry/")
+        || path.starts_with("/api/claude_code_penguin_mode")
+    {
+        return HttpProfile::AxiosBare;
+    }
+    // axios + claude-cli UA 特例（grove）
+    if path.starts_with("/api/claude_code_grove") {
+        return HttpProfile::AxiosClaudeCli;
+    }
+    // axios + claude-code/X UA（OAuth、遥测、启动引导）
+    if path.starts_with("/api/oauth/")
+        || path.starts_with("/api/event_logging")
+        || path.starts_with("/api/claude_cli/bootstrap")
+    {
+        return HttpProfile::AxiosClaudeCode;
+    }
+    // 默认 Stainless（/v1/messages 及未显式列出的主路径）
+    HttpProfile::Stainless
+}
+
+/// 构造 axios 系列 profile 的 header 模板。
+/// 与 Stainless 的主要区别：
+///   - accept: "application/json, text/plain, */*"（而非纯 application/json）
+///   - accept-encoding: "gzip, compress, deflate, br"（带 compress）
+///   - 不发 X-Stainless-* / sec-fetch-mode / accept-language / session-id / client-request-id
+fn build_axios_headers(profile: HttpProfile, version: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    out.insert(
+        "Accept".into(),
+        "application/json, text/plain, */*".into(),
+    );
+    out.insert(
+        "accept-encoding".into(),
+        "gzip, compress, deflate, br".into(),
+    );
+    let ua = match profile {
+        HttpProfile::AxiosBare => "axios/1.13.6".to_string(),
+        HttpProfile::AxiosClaudeCode => format!("claude-code/{}", version),
+        HttpProfile::AxiosClaudeCli => format!("claude-cli/{} (external, cli)", version),
+        HttpProfile::Stainless => unreachable!("build_axios_headers called for Stainless"),
+    };
+    out.insert("User-Agent".into(), ua);
+    // HAR 证实：带 claude-cli/claude-code UA 的 axios 请求都发 anthropic-beta: oauth-2025-04-20
+    // 裸 axios（/v1/mcp_servers, /mcp-registry/*）不发 anthropic-beta
+    if !matches!(profile, HttpProfile::AxiosBare) {
+        out.insert("anthropic-beta".into(), "oauth-2025-04-20".into());
+        out.insert(
+            "anthropic-dangerous-direct-browser-access".into(),
+            "true".into(),
+        );
+        out.insert("content-type".into(), "application/json".into());
+    }
+    out
+}
+
 const DEFAULT_VERSION: &str = crate::config::CLAUDE_CODE_VERSION;
 
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
@@ -146,6 +228,7 @@ impl Rewriter {
         client_type: ClientType,
         model_id: &str,
         body_map: &serde_json::Value,
+        path: &str,
     ) -> HashMap<String, String> {
         let env = self.parse_env(account);
         let version = if env.version.is_empty() {
@@ -153,6 +236,14 @@ impl Rewriter {
         } else {
             &env.version
         };
+
+        // 按 endpoint path 分发到对应 HTTP client profile。
+        // Stainless profile（/v1/messages 等）走下方完整模板；
+        // 其余 axios profile 直接返回精简 axios-style header，不走 Stainless 逻辑。
+        let profile = determine_http_profile(path);
+        if !matches!(profile, HttpProfile::Stainless) {
+            return build_axios_headers(profile, version);
+        }
 
         let mut out = HashMap::new();
 

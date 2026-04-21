@@ -273,6 +273,7 @@ impl GatewayService {
             client_type,
             model_id,
             &rewritten_body_map,
+            &path,
         );
 
         let final_body = if client_type == ClientType::API {
