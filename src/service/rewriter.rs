@@ -379,11 +379,25 @@ impl Rewriter {
             // 剥离 system 块中的 cache_control
             strip_cache_control(body);
 
-            // 确保 max_tokens 存在（真实 CLI v2.1.109 对 Opus 使用 64000）
+            // 确保 max_tokens 存在，按模型分流默认值（基于真实 CLI v2.1.109 抓包）：
+            //   Opus   → 64000 (claude-opus-4-6/4-7)
+            //   Sonnet → 32000 (claude-sonnet-4-6)
+            //   Haiku  → 32000 (claude-haiku-4-5)
+            //   其他   → 64000 (保守默认，多数新模型上限)
             if body.get("max_tokens").is_none() {
+                let model_id = body
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let default_max_tokens = if model_id.contains("haiku") || model_id.contains("sonnet") {
+                    32000
+                } else {
+                    64000
+                };
                 body.as_object_mut()
                     .unwrap()
-                    .insert("max_tokens".into(), serde_json::json!(64000));
+                    .insert("max_tokens".into(), serde_json::json!(default_max_tokens));
             }
 
             // 注入 Claude Code 系统提示词
