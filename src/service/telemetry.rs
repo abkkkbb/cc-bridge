@@ -400,10 +400,23 @@ async fn telemetry_loop(
         }
 
         // --- metrics (/api/claude_code/metrics) ---
-        // 真实 CC (bigqueryExporter.ts) 对 OAuth 用户也会发，只要 token 有 user:profile scope。
-        // 修复前的 "OAuth 不支持" 注释是错的 — 完全静默会被识别为代理。
+        // HAR 实测 (cc-reqable/*.har, 27.8 分钟真实 CLI 零次发送): 真实 CC CLI 默认
+        // 不发此 endpoint。build_metrics 目前返回 metrics=[] 空数组，被 Anthropic 以
+        // 400 "At least one metric must be provided" 拒绝，每分钟一条错误日志累积成
+        // 机器人证据链，直接触发 OAuth permission_error 组织级封禁。
+        // 修复: 若 metrics 数组为空则跳过发送 (等同真实 CLI 默认行为)，同时仍更新
+        // last_metrics_at 计时器避免每 tick 重试。
         if now.duration_since(session.last_metrics_at) >= METRICS_INTERVAL {
             let payload = build_metrics(&session.account);
+            let metrics_empty = payload
+                .get("metrics")
+                .and_then(|m| m.as_array())
+                .map_or(true, |a| a.is_empty());
+            if metrics_empty {
+                session.last_metrics_at = now;
+                drop(map);
+                continue;
+            }
             let token = session.token.clone();
             let c = client.clone();
             session.last_metrics_at = now;
