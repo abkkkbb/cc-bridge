@@ -100,6 +100,17 @@ impl CacheStore for RedisStore {
         let _: Result<(), _> = self.client.clone().decr(key, 1i64).await;
     }
 
+    async fn peek_slot(&self, key: &str) -> i64 {
+        match self.client.clone().get::<_, Option<String>>(key).await {
+            Ok(Some(s)) => s.parse::<i64>().unwrap_or(0),
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "redis peek_slot failed, returning 0");
+                0
+            }
+        }
+    }
+
     async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError> {
         let mut conn = self.client.clone();
         let result: Option<String> = redis::cmd("SET")

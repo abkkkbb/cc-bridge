@@ -233,6 +233,13 @@ impl AccountService {
         self.cache.release_slot(&key).await;
     }
 
+    /// 读取账号当前并发占用（best-effort 快照，供管理界面显示）。
+    /// 对外保证非负：Redis 过期键遇 DECR 会落到负数，这里统一 clamp 到 0。
+    pub async fn peek_concurrency(&self, account_id: i64) -> i64 {
+        let key = format!("concurrency:account:{}", account_id);
+        self.cache.peek_slot(&key).await.max(0)
+    }
+
     /// 构造一个绑定到该账号并发槽的 SlotHolder（不会自行获取；调用者需先 acquire_slot）。
     pub fn slot_holder_for(&self, account_id: i64) -> crate::service::gateway::SlotHolder {
         let key = format!("concurrency:account:{}", account_id);

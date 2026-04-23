@@ -90,6 +90,10 @@ impl CacheStore for MemoryStore {
         }
     }
 
+    async fn peek_slot(&self, key: &str) -> i64 {
+        self.slots.lock().await.get(key).copied().unwrap_or(0)
+    }
+
     async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError> {
         let mut locks = self.locks.lock().await;
         let now = tokio::time::Instant::now();

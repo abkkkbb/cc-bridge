@@ -13,6 +13,9 @@ pub trait CacheStore: Send + Sync {
     async fn delete_session(&self, session_hash: &str) -> Result<(), AppError>;
     async fn acquire_slot(&self, key: &str, max: i32, ttl: Duration) -> Result<bool, AppError>;
     async fn release_slot(&self, key: &str);
+    /// 读取当前槽位计数（best-effort 快照，供管理界面显示）。
+    /// Redis 错误或 key 不存在时返回 0；极端情况下由于 DECR 可能产生负数，调用方需自行 clamp。
+    async fn peek_slot(&self, key: &str) -> i64;
     async fn acquire_lock(&self, key: &str, owner: &str, ttl: Duration) -> Result<bool, AppError>;
     async fn release_lock(&self, key: &str, owner: &str);
 }

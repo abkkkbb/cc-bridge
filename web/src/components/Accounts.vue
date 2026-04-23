@@ -621,7 +621,7 @@ async function copyText(text: string) {
             <div class="grid grid-cols-3 gap-3">
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">并发</p>
-                <p class="text-sm font-medium text-[#29261e]">{{ a.concurrency }}</p>
+                <p class="text-sm font-medium text-[#29261e]">{{ Math.max(0, a.current_concurrency ?? 0) }}/{{ a.concurrency }}</p>
               </div>
               <div class="text-center">
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider">优先级</p>

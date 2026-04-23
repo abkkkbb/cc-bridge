@@ -158,6 +158,8 @@ async fn list_accounts(
         if let Some(expires) = state.telemetry_svc.get_session_expires_at(a.id).await {
             obj["telemetry_expires_at"] = serde_json::json!(expires.to_rfc3339());
         }
+        obj["current_concurrency"] =
+            serde_json::json!(state.account_svc.peek_concurrency(a.id).await);
         data.push(obj);
     }
 

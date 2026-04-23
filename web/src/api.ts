@@ -49,6 +49,7 @@ export interface Account {
   organization_uuid?: string | null
   subscription_type?: string | null
   concurrency: number
+  current_concurrency?: number
   priority: number
   auto_telemetry: boolean
   telemetry_count: number
