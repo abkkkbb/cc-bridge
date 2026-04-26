@@ -73,6 +73,7 @@ pub fn build_router(
         )
         .route("/admin/accounts/:id/test", post(test_account))
         .route("/admin/accounts/:id/usage", post(refresh_usage))
+        .route("/admin/accounts/:id/clear_limit", post(clear_limit_state))
         .route("/admin/tokens", get(list_tokens).post(create_token))
         .route(
             "/admin/tokens/:id",
@@ -406,6 +407,23 @@ async fn refresh_usage(
             ))
         }
     }
+}
+
+/// 手动清除指定账号的内存软限流标记（rate_limited_until / status=Rejected）。
+///
+/// 触发场景：admin UI 显示账号 5h/7d 用量已重置但调度器仍持续过滤该账号——
+/// 这通常是 `absorb_headers` 写入的旧标记没有机会被新请求刷新（因为本地挡了所以
+/// 没请求发出去 → 死锁）。`refresh_usage` 自动清理已经覆盖大部分场景，此 endpoint
+/// 作为最后的人工逃生口。
+async fn clear_limit_state(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cleared = state.account_svc.clear_limit_runtime_flags(id);
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "cleared": cleared,
+    })))
 }
 
 // --- Token Handlers ---
