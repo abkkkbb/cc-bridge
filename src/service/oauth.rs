@@ -121,6 +121,7 @@ pub async fn refresh_oauth_token(
     let resp = client
         .post(OAUTH_TOKEN_URL)
         .header("Content-Type", "application/json")
+        .header("accept-encoding", "gzip, compress, deflate, br")
         .json(&body)
         .send()
         .await
@@ -168,6 +169,7 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
+        .header("accept-encoding", "gzip, compress, deflate, br")
         .header(
             "User-Agent",
             format!("claude-code/{}", crate::config::CLAUDE_CODE_VERSION),
