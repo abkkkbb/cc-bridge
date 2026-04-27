@@ -298,7 +298,6 @@ impl OAuthFlowService {
         let resp = client
             .post(TOKEN_URL)
             .header("Content-Type", "application/json")
-            .header("accept-encoding", "gzip, compress, deflate, br")
             .json(&body)
             .send()
             .await
