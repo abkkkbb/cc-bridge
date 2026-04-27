@@ -191,6 +191,7 @@ struct CreateAccountRequest {
     concurrency: Option<i32>,
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
+    experimental_reveal_thinking: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +238,7 @@ async fn create_account(
         disable_reason: String::new(),
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
+        experimental_reveal_thinking: req.experimental_reveal_thinking.unwrap_or(false),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         created_at: chrono::Utc::now(),
@@ -349,6 +351,12 @@ async fn update_account(
     }
     if let Some(auto_telemetry) = updates.get("auto_telemetry").and_then(|v| v.as_bool()) {
         existing.auto_telemetry = auto_telemetry;
+    }
+    if let Some(reveal) = updates
+        .get("experimental_reveal_thinking")
+        .and_then(|v| v.as_bool())
+    {
+        existing.experimental_reveal_thinking = reveal;
     }
 
     state.account_svc.update_account(&existing).await?;

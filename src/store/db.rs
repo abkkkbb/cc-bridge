@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -97,7 +97,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
     let cols = existing_columns(pool, driver, "accounts").await;
 
-    let pending: [(&str, String); 15] = [
+    let pending: [(&str, String); 16] = [
         (
             "billing_mode",
             "ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'".into(),
@@ -157,6 +157,10 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         (
             "telemetry_count",
             "ALTER TABLE accounts ADD COLUMN telemetry_count INTEGER NOT NULL DEFAULT 0".into(),
+        ),
+        (
+            "experimental_reveal_thinking",
+            "ALTER TABLE accounts ADD COLUMN experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0".into(),
         ),
     ];
     for (name, sql) in pending.iter() {
@@ -278,6 +282,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     disable_reason       TEXT NOT NULL DEFAULT '',
     auto_telemetry       INTEGER NOT NULL DEFAULT 0,
     telemetry_count      INTEGER NOT NULL DEFAULT 0,
+    experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0,
     usage_data           TEXT NOT NULL DEFAULT '{}',
     usage_fetched_at     TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -315,6 +320,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     disable_reason       TEXT NOT NULL DEFAULT '',
     auto_telemetry       INT NOT NULL DEFAULT 0,
     telemetry_count      BIGINT NOT NULL DEFAULT 0,
+    experimental_reveal_thinking INT NOT NULL DEFAULT 0,
     usage_data           JSONB NOT NULL DEFAULT '{}',
     usage_fetched_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
