@@ -129,7 +129,8 @@ fn build_axios_headers(profile: HttpProfile, version: &str) -> HashMap<String, S
     };
     out.insert("User-Agent".into(), ua);
     // HAR 证实：带 claude-cli/claude-code UA 的 axios 请求都发 anthropic-beta: oauth-2025-04-20
-    // 裸 axios（/v1/mcp_servers, /mcp-registry/*）不发 anthropic-beta
+    // 以及 x-service-name: claude-code（v119/v132 全 43/43 遥测请求 100% 携带）
+    // 裸 axios（/v1/mcp_servers, /mcp-registry/*）不发 anthropic-beta / x-service-name
     if !matches!(profile, HttpProfile::AxiosBare) {
         out.insert("anthropic-beta".into(), "oauth-2025-04-20".into());
         out.insert(
@@ -137,6 +138,7 @@ fn build_axios_headers(profile: HttpProfile, version: &str) -> HashMap<String, S
             "true".into(),
         );
         out.insert("content-type".into(), "application/json".into());
+        out.insert("x-service-name".into(), "claude-code".into());
     }
     out
 }

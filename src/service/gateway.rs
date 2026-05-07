@@ -348,16 +348,23 @@ impl GatewayService {
         slot: SlotHolder,
         rid: &str,
     ) -> Result<Response, AppError> {
+        // 仅 /v1/messages 强制带 ?beta=true（HAR 证实：v119/v132 的 messages 100% 带，
+        // 其他路径如 /api/event_logging/v2/batch、/api/oauth/* 真实 CLI 100% 不带 query）。
         let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
-        if !query.is_empty() {
-            let q = if query.contains("beta=true") {
+        let needs_beta_query = path.starts_with("/v1/messages");
+        let final_query = if needs_beta_query {
+            if query.is_empty() {
+                "beta=true".to_string()
+            } else if query.split('&').any(|p| p == "beta=true") {
                 query.to_string()
             } else {
                 format!("{}&beta=true", query)
-            };
-            target_url = format!("{}?{}", target_url, q);
+            }
         } else {
-            target_url = format!("{}?beta=true", target_url);
+            query.to_string()
+        };
+        if !final_query.is_empty() {
+            target_url = format!("{}?{}", target_url, final_query);
         }
 
         debug!("upstream URL: {}", target_url);
