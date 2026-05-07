@@ -7,7 +7,7 @@ use std::path::Path;
 /// 升级只需改一处（不设 env 时）或重新构建（设 env 时）。
 pub const CLAUDE_CODE_VERSION: &str = match option_env!("CC_VERSION") {
     Some(v) => v,
-    None => "2.1.109",
+    None => "2.1.119",
 };
 
 #[derive(Clone)]

@@ -373,18 +373,14 @@ impl Rewriter {
             out.entry("anthropic-dangerous-direct-browser-access".into())
                 .or_insert_with(|| "true".into());
 
-            // v2.1.109 标准 header 兜底：客户端未传时由 gateway 补齐，
-            // 让出站指纹独立于下游 CLI 版本（避免下游 v2.1.81 客户端导致缺字段）。
+            // v2.1.119 标准 header 兜底：仅补齐协议必需值。
+            // accept-* / sec-fetch-mode 由客户端 Node runtime 自行决定
+            // （v119 默认 Node 24 不发 accept-language / sec-fetch-mode），
+            // 由 gateway 强行 fallback 反而会引入与真实 v119 wire 不一致的指纹差异。
             out.entry("Accept".into())
                 .or_insert_with(|| "application/json".into());
             out.entry("anthropic-version".into())
                 .or_insert_with(|| "2023-06-01".into());
-            out.entry("accept-encoding".into())
-                .or_insert_with(|| "br, gzip, deflate".into());
-            out.entry("accept-language".into())
-                .or_insert_with(|| "*".into());
-            out.entry("sec-fetch-mode".into())
-                .or_insert_with(|| "cors".into());
             out.entry("x-app".into())
                 .or_insert_with(|| "cli".into());
             out.entry("X-Stainless-Retry-Count".into())
