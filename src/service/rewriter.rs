@@ -439,7 +439,7 @@ impl Rewriter {
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type);
-        } else if path.contains("/event_logging/batch") {
+        } else if path.starts_with("/api/event_logging/") {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
             self.rewrite_growthbook_eval(&mut parsed, account);

@@ -31,8 +31,12 @@ const GROWTHBOOK_CLIENT_KEY: &str = "sdk-zAZezfDKGoZuXXKe";
 // ---------------------------------------------------------------------------
 
 /// 判断请求路径是否为遥测端点。
+///
+/// 真实 CLI v2.1.119 / v2.1.132 抓包确认 event_logging 端点为
+/// `/api/event_logging/v2/batch`（带 `v2`）。历史上的 `/api/event_logging/batch`
+/// （无 v2）已被 Anthropic 弃用 — 旧字符串匹配会漏掉所有真实 v119+ telemetry。
 pub fn is_telemetry_path(path: &str) -> bool {
-    path.contains("/event_logging/batch")
+    path.starts_with("/api/event_logging/")
         || path.starts_with("/api/eval/")
         || path.starts_with("/api/claude_code/metrics")
         || path.starts_with("/api/claude_code/organizations/metrics_enabled")
@@ -362,7 +366,7 @@ async fn telemetry_loop(
 
             send_telemetry(
                 &c,
-                &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
+                &format!("{}/api/event_logging/v2/batch", UPSTREAM_BASE),
                 &token,
                 &payload,
                 &session_ua(&store, account_id).await,
@@ -1268,6 +1272,9 @@ mod tests {
 
     #[test]
     fn is_telemetry_path_matches_known_endpoints() {
+        // 真实 v2.1.119 / v2.1.132 CLI 用的 v2 路径
+        assert!(is_telemetry_path("/api/event_logging/v2/batch"));
+        // 历史 v1 路径也兼容（向后保险）
         assert!(is_telemetry_path("/api/event_logging/batch"));
         assert!(is_telemetry_path("/api/eval/sdk-zAZezfDKGoZuXXKe"));
         assert!(is_telemetry_path("/api/claude_code/metrics"));
