@@ -168,8 +168,16 @@ pub fn generate_canonical_identity() -> (String, Value, Value, Value) {
     (device_id, env_json, prompt_json, process_json)
 }
 
-/// 构造 proto schema 完整的 env JSON（含所有 ~30 个字段）。
-/// 供 rewriter 和 telemetry 共用，避免重复定义。
+/// 构造与真实 CLI 对齐的 env JSON（21 字段）。
+///
+/// 跨 20 个抓包文件（v2.1.81 → v2.1.132 共 6 个 CLI 版本，5,951 个 telemetry env block）
+/// 实证：真实 CLI 永远只发以下 21 字段。原先 32 字段中多出的 12 个
+/// （github_*/wsl_version/remote_environment_type/claude_code_container_id/
+/// claude_code_remote_session_id/tags/coworker_type/linux_distro_*/linux_kernel）
+/// 在所有抓包中 0 出现 — 是 Rust 重写时（commit a00bafc）误加的稳定指纹特征，
+/// TS 原作 cc-gateway 也只发 21 字段，已删除。
+///
+/// 注：is_running_with_bun 之前硬编码 false，改为读取 env 真值（CanonicalEnvData 已有此字段）。
 pub fn build_full_env_json(env: &CanonicalEnvData) -> Value {
     serde_json::json!({
         "platform": env.platform,
@@ -179,32 +187,19 @@ pub fn build_full_env_json(env: &CanonicalEnvData) -> Value {
         "terminal": env.terminal,
         "package_managers": env.package_managers,
         "runtimes": env.runtimes,
-        "is_running_with_bun": false,
-        "is_ci": false,
-        "is_claubbit": false,
-        "is_claude_code_remote": false,
-        "is_local_agent_mode": false,
-        "is_conductor": false,
-        "is_github_action": false,
-        "is_claude_code_action": false,
+        "is_running_with_bun": env.is_running_with_bun,
+        "is_ci": env.is_ci,
+        "is_claubbit": env.is_claubbit,
+        "is_claude_code_remote": env.is_claude_code_remote,
+        "is_local_agent_mode": env.is_local_agent_mode,
+        "is_conductor": env.is_conductor,
+        "is_github_action": env.is_github_action,
+        "is_claude_code_action": env.is_claude_code_action,
         "is_claude_ai_auth": env.is_claude_ai_auth,
         "version": env.version,
         "version_base": env.version_base,
         "build_time": env.build_time,
         "deployment_environment": env.deployment_environment,
         "vcs": env.vcs,
-        "github_event_name": "",
-        "github_actions_runner_environment": "",
-        "github_actions_runner_os": "",
-        "github_action_ref": "",
-        "wsl_version": "",
-        "remote_environment_type": "",
-        "claude_code_container_id": "",
-        "claude_code_remote_session_id": "",
-        "tags": [],
-        "coworker_type": "",
-        "linux_distro_id": "",
-        "linux_distro_version": "",
-        "linux_kernel": "",
     })
 }
