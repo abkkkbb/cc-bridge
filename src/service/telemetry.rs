@@ -902,6 +902,7 @@ mod tests {
             auto_telemetry: true,
             telemetry_count: 0,
             experimental_reveal_thinking: false,
+            five_hour_threshold: 0.97,
             usage_data: json!({}),
             usage_fetched_at: None,
             created_at: Utc::now(),
