@@ -230,6 +230,19 @@ impl GatewayService {
                 } else {
                     fake_telemetry_response()
                 };
+                // 把客户端发过来、即将被 fake-200 丢弃的真实遥测 body 持久到 docker logs。
+                // 当前 ccb 的 TelemetryService 仅合成 4 种 tengu_ 事件（v2.1.88 真实 CLI 共 828 种），
+                // 多样性差距巨大。这条日志是为将来"passthrough + rewrite"架构改造保存语料：
+                // 知道这个 deployment 里实际命中了哪些事件类型 / 各事件携带哪些字段 / 真实 batch 节奏。
+                // PII 注意：含 device_id / email / session_id，仅用于本机分析，勿外传。
+                info!(
+                    target: "telemetry-capture",
+                    "intercepted client telemetry: account={} path={} body_size={} body={}",
+                    account.id,
+                    path,
+                    body_bytes.len(),
+                    truncate_body(&body_bytes, 16384)
+                );
                 debug!("telemetry: intercepted {} for account {}", path, account.id);
                 return Ok(axum::Json(body).into_response());
             }
