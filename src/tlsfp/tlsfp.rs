@@ -351,7 +351,14 @@ fn make_request_client_with_read_timeout(
         }
     }
 
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder.build().unwrap_or_else(|e| {
+        tracing::error!(
+            target: "tls",
+            "TLS fingerprint reqwest::Client builder failed: {} — falling back to default reqwest::Client (TLS fingerprint disabled, JA4+ exposed!)",
+            e
+        );
+        reqwest::Client::new()
+    })
 }
 
 #[cfg(test)]

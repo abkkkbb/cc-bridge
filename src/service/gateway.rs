@@ -68,8 +68,17 @@ impl Drop for SlotHolder {
         let cache = self.cache.clone();
         let key = std::mem::take(&mut self.key);
         // 与旧 scopeguard 一致，使用 tokio::spawn 异步释放（Drop 可能在同步上下文）
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move { cache.release_slot(&key).await });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { cache.release_slot(&key).await });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "slot",
+                    "SlotHolder dropped outside tokio runtime — slot \"{}\" leaked (will free on next acquire/release)",
+                    key
+                );
+            }
         }
     }
 }
@@ -313,6 +322,7 @@ impl GatewayService {
                 account.id,
                 status.as_u16()
             );
+            log_upstream_error_headers(account.id, status.as_u16(), resp.headers());
             return Ok(wrap_5xx_response(resp));
         }
 
@@ -334,6 +344,7 @@ impl GatewayService {
                 account.id
             );
         }
+        log_upstream_error_headers(account.id, status.as_u16(), resp.headers());
         Ok(wrap_429_response(resp))
     }
 
@@ -478,6 +489,24 @@ const GATEWAY_HEADER_PREFIXES: &[&str] = &[
 fn is_gateway_fingerprint_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     GATEWAY_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// 把上游 5xx/429 响应头**剥离前**全量 dump 到日志，便于事后审计 / 决定是否扩展剥离白名单。
+/// target=upstream-error，info 级常驻，单条单行，多 header 用 "; " 分隔。
+fn log_upstream_error_headers(account_id: i64, status_code: u16, headers: &HeaderMap) {
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(headers.len() * 32);
+    for (k, v) in headers {
+        let val = v.to_str().unwrap_or("<binary>");
+        let _ = write!(&mut buf, "{}={}; ", k.as_str(), val);
+    }
+    info!(
+        target: "upstream-error",
+        "upstream error headers (pre-strip): account={} status={} headers=[{}]",
+        account_id,
+        status_code,
+        buf.trim_end_matches("; ")
+    );
 }
 
 /// 黏性透传策略下，把上游 429 响应包装成 Anthropic 标准格式的通用文案，

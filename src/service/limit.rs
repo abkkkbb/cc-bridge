@@ -219,31 +219,54 @@ impl LimitStore {
         new_state.updated_at = Some(Instant::now());
 
         let flush_r = flush_reason(&prev, &new_state);
+        let prev_5h = prev.five_hour.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+        let new_5h = new_state.five_hour.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+        let prev_7d = prev.seven_day.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+        let new_7d = new_state.seven_day.as_ref().map(|w| w.utilization).unwrap_or(0.0);
+        let util_changed =
+            (new_5h - prev_5h).abs() > 0.005 || (new_7d - prev_7d).abs() > 0.005;
+        let status_changed = prev.status != new_state.status;
+        let rl_changed = prev.rate_limited_until != new_state.rate_limited_until;
+        let sonnet_changed = prev.sonnet_limited_until != new_state.sonnet_limited_until;
         if let Some(reason) = flush_r {
             // 抢先占位：即使 flush 失败也先记，下次 5min 后再尝试，避免连续失败造成风暴。
             new_state.last_db_flush_at = Some(Instant::now());
-            let five = new_state
-                .five_hour
-                .as_ref()
-                .map(|w| w.utilization)
-                .unwrap_or(0.0);
-            let seven = new_state
-                .seven_day
-                .as_ref()
-                .map(|w| w.utilization)
-                .unwrap_or(0.0);
             info!(
-                "limit absorb: account {} status={} → flush ({}) 5h={:.1}% 7d={:.1}% status={}",
+                target: "limit",
+                "absorb account {} status={} → flush ({}) 5h={:.1}%→{:.1}% 7d={:.1}%→{:.1}% st={}→{}",
                 account_id,
                 status,
                 reason,
-                five * 100.0,
-                seven * 100.0,
+                prev_5h * 100.0,
+                new_5h * 100.0,
+                prev_7d * 100.0,
+                new_7d * 100.0,
+                prev.status.unwrap_or(UnifiedStatus::Allowed).as_str(),
                 new_state.status.unwrap_or(UnifiedStatus::Allowed).as_str(),
+            );
+        } else if util_changed || status_changed || rl_changed || sonnet_changed {
+            // 状态有迁移但未触发 flush：常态线上日志，方便事后排查
+            // "为什么 87% 的账号被踢"——能直接看到 absorb 解析出的真实利用率。
+            info!(
+                target: "limit",
+                "absorb account {} status={} → state-update 5h={:.1}%→{:.1}% 7d={:.1}%→{:.1}% st={}→{} rl_until={}",
+                account_id,
+                status,
+                prev_5h * 100.0,
+                new_5h * 100.0,
+                prev_7d * 100.0,
+                new_7d * 100.0,
+                prev.status.unwrap_or(UnifiedStatus::Allowed).as_str(),
+                new_state.status.unwrap_or(UnifiedStatus::Allowed).as_str(),
+                new_state
+                    .rate_limited_until
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "none".into()),
             );
         } else {
             debug!(
-                "limit absorb: account {} status={} → no flush (within TTL, no threshold event)",
+                target: "limit",
+                "absorb account {} status={} → no change (within TTL, no transition)",
                 account_id, status
             );
         }

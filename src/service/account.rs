@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountAuthType};
-use crate::service::limit::LimitStore;
+use crate::service::limit::{Availability, LimitStore};
 use crate::service::rewriter::ClientType;
 use crate::store::account_store::AccountStore;
 use crate::store::cache::CacheStore;
@@ -175,29 +175,42 @@ impl AccountService {
         // 过滤：排除项 + 可用账号限制 + 限流状态（内存热态）
         // Sonnet 请求旁路：走 Sonnet 专属 ban 检查而非全量 availability，
         // 让 5h/7d 高利用率 / RPM·TPM 预抢等本地软限流不挡 Sonnet，同时仍能避开刚撞到 Sonnet 429 的账号。
+        // 每个账号被踢的具体原因走 debug 级（target=select），常态不污染日志，
+        // 排查"为啥这个账号没被选上"时打开 RUST_LOG=ccb::service::account=debug 即可。
         let mut limited_out: Vec<i64> = Vec::new();
         let candidates: Vec<Account> = accounts
             .into_iter()
             .filter(|a| {
                 if exclude_ids.contains(&a.id) {
+                    debug!(target: "select", "account {} skip: token blocked", a.id);
                     return false;
                 }
                 if !(allowed_ids.is_empty() || allowed_ids.contains(&a.id)) {
+                    debug!(target: "select", "account {} skip: not in token allow list", a.id);
                     return false;
                 }
                 if skip_rate_limit_filter {
                     if !self.limit_store.sonnet_available(a.id) {
+                        debug!(target: "select", "account {} skip: sonnet ban (sticky 7d sonnet quota or status=rejected)", a.id);
                         limited_out.push(a.id);
                         return false;
                     }
                     return true;
                 }
-                let availability = self.limit_store.availability(a.id, a.five_hour_threshold);
-                if !availability.is_available() {
-                    limited_out.push(a.id);
-                    return false;
+                match self.limit_store.availability(a.id, a.five_hour_threshold) {
+                    Availability::Unavailable { reason, until } => {
+                        debug!(
+                            target: "select",
+                            "account {} skip: {} (until={})",
+                            a.id,
+                            reason,
+                            until.map(|t| t.to_rfc3339()).unwrap_or_else(|| "n/a".into())
+                        );
+                        limited_out.push(a.id);
+                        false
+                    }
+                    Availability::Available => true,
                 }
-                true
             })
             .collect();
 
@@ -383,19 +396,60 @@ impl AccountService {
             .await?;
 
         if acquired {
+            info!(
+                target: "oauth",
+                "account {} → refresh lock acquired (owner={}), starting refresh",
+                account.id,
+                &lock_owner[..8]
+            );
             let result = self.refresh_oauth_access_token(account.id).await;
             self.cache.release_lock(&lock_key, &lock_owner).await;
+            match &result {
+                Ok(_) => info!(
+                    target: "oauth",
+                    "account {} → refresh lock released, token refresh OK",
+                    account.id
+                ),
+                Err(e) => warn!(
+                    target: "oauth",
+                    "account {} → refresh lock released, token refresh ERR: {}",
+                    account.id, e
+                ),
+            }
             return result;
         }
 
-        for _ in 0..OAUTH_WAIT_ATTEMPTS {
+        info!(
+            target: "oauth",
+            "account {} → refresh lock contended (owner={}), waiting up to {}ms × {} for peer refresh",
+            account.id,
+            &lock_owner[..8],
+            OAUTH_WAIT_RETRY.as_millis(),
+            OAUTH_WAIT_ATTEMPTS
+        );
+
+        for attempt in 0..OAUTH_WAIT_ATTEMPTS {
             sleep(OAUTH_WAIT_RETRY).await;
             let latest = self.store.get_by_id(account.id).await?;
             if latest.has_valid_oauth_access_token(OAUTH_REFRESH_BUFFER_SECONDS) {
+                info!(
+                    target: "oauth",
+                    "account {} → peer refresh succeeded after {} retries, reusing access token",
+                    account.id,
+                    attempt + 1
+                );
                 return Ok(latest.access_token);
             }
         }
 
+        warn!(
+            target: "oauth",
+            "account {} → wait timeout ({} retries × {}ms = {}s), peer refresh did not yield valid token",
+            account.id,
+            OAUTH_WAIT_ATTEMPTS,
+            OAUTH_WAIT_RETRY.as_millis(),
+            (OAUTH_WAIT_RETRY * OAUTH_WAIT_ATTEMPTS as u32).as_secs()
+        );
         Err(AppError::ServiceUnavailable(
             "oauth token refresh timeout".into(),
         ))
