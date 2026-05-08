@@ -23,8 +23,12 @@ rustls-pki-types = "1"
 static_init = "1"
 
 # Serialization
+# preserve_order: serde_json::Value::Object 默认 BTreeMap 会把字段重排为字母序。
+# 真实 CLI 抓包（66 条 /v1/messages）字段顺序固定为 model→messages→system→tools→
+# metadata→max_tokens→thinking→context_management→output_config→stream，BTreeMap
+# 会破坏这个顺序产生字节级指纹偏离。开启 IndexMap 保持原始字段顺序。
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "postgres", "chrono", "any"] }
