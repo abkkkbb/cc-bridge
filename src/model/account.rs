@@ -185,6 +185,11 @@ pub struct Account {
     /// Anthropic 可能反 fingerprint，建议仅在测试账号开启。每个账号独立控制。
     #[serde(default)]
     pub experimental_reveal_thinking: bool,
+    /// 5h 利用率"防打满"阈值。当 unified-5h utilization >= 此值时，
+    /// select_account 跳过该号。范围 [0.5, 1.0]，默认 0.97。
+    /// 7d 窗口仍用全局 HIT_THRESHOLD（0.97），不受此字段影响。
+    #[serde(default = "default_five_hour_threshold")]
+    pub five_hour_threshold: f64,
     #[serde(default)]
     pub usage_data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +203,21 @@ fn default_concurrency() -> i32 {
 }
 fn default_priority() -> i32 {
     50
+}
+pub fn default_five_hour_threshold() -> f64 {
+    0.97
+}
+
+/// 5h 阈值合法区间：[0.5, 1.0]，且不能是 NaN/inf。
+/// codex 建议：UI 可绕过，后端必须硬挡。
+pub fn validate_five_hour_threshold(value: f64) -> Result<f64, &'static str> {
+    if !value.is_finite() {
+        return Err("threshold must be finite (no NaN/inf)");
+    }
+    if !(0.5..=1.0).contains(&value) {
+        return Err("threshold must be within [0.5, 1.0]");
+    }
+    Ok(value)
 }
 
 impl Account {

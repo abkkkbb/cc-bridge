@@ -253,12 +253,16 @@ impl LimitStore {
     }
 
     /// Selector 用：当前账号可否调度。内存无记录 → 乐观 Available。
-    pub fn availability(&self, account_id: i64) -> Availability {
+    ///
+    /// `five_hour_threshold` 是该账号的"防打满"5h 阈值（[0.5, 1.0]，默认 0.97），
+    /// 来源于 Account.five_hour_threshold（管理端可调）。
+    /// 7d 窗口仍用全局 [`HIT_THRESHOLD`] 0.97。
+    pub fn availability(&self, account_id: i64, five_hour_threshold: f64) -> Availability {
         let map = self.states.lock().unwrap();
         let Some(state) = map.get(&account_id) else {
             return Availability::Available;
         };
-        judge_availability(state)
+        judge_availability(state, five_hour_threshold)
     }
 
     /// Sonnet selector 用：只检查 Sonnet 专属 ban 和全局 Rejected。
@@ -820,7 +824,12 @@ fn bottleneck_limit_until(state: &LimitState) -> Option<DateTime<Utc>> {
     picks.into_iter().max()
 }
 
-fn judge_availability(state: &LimitState) -> Availability {
+/// 判断账号是否可用。
+///
+/// `five_hour_threshold` 来自调用方（通常是 Account.five_hour_threshold），
+/// 范围 [0.5, 1.0]。非法值由调用方负责 fallback 到 [`HIT_THRESHOLD`]。
+/// 7d 窗口固定用 [`HIT_THRESHOLD`]，不接受逐账号配置。
+fn judge_availability(state: &LimitState, five_hour_threshold: f64) -> Availability {
     // 短期隔离优先判定：遇到过 429（无论 CF-layer 还是 Anthropic 无 reset 的 fallback）
     if let Some(until) = state.rate_limited_until {
         if until > Utc::now() {
@@ -840,9 +849,13 @@ fn judge_availability(state: &LimitState) -> Availability {
         }
     }
     if let Some(w) = &state.five_hour {
-        if w.utilization >= HIT_THRESHOLD && w.resets_at > Utc::now() {
+        if w.utilization >= five_hour_threshold && w.resets_at > Utc::now() {
             return Availability::Unavailable {
-                reason: format!("5 小时窗口已用 {:.1}%", w.utilization * 100.0),
+                reason: format!(
+                    "5 小时窗口已用 {:.1}%（阈值 {:.0}%）",
+                    w.utilization * 100.0,
+                    five_hour_threshold * 100.0
+                ),
                 until: Some(w.resets_at),
             };
         }
@@ -1123,7 +1136,7 @@ mod tests {
     #[test]
     fn availability_empty_is_available() {
         let state = LimitState::default();
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, HIT_THRESHOLD).is_available());
     }
 
     #[test]
@@ -1138,7 +1151,7 @@ mod tests {
             status: Some(UnifiedStatus::Allowed),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, HIT_THRESHOLD).is_available());
     }
 
     #[test]
@@ -1152,7 +1165,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        match judge_availability(&state) {
+        match judge_availability(&state, HIT_THRESHOLD) {
             Availability::Unavailable { until, .. } => assert!(until.is_some()),
             Availability::Available => panic!("should be unavailable"),
         }
@@ -1164,7 +1177,7 @@ mod tests {
             status: Some(UnifiedStatus::Rejected),
             ..Default::default()
         };
-        assert!(!judge_availability(&state).is_available());
+        assert!(!judge_availability(&state, HIT_THRESHOLD).is_available());
     }
 
     #[test]
@@ -1179,7 +1192,61 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, HIT_THRESHOLD).is_available());
+    }
+
+    // ---- per-account 5h threshold (plan C) ----
+
+    #[test]
+    fn availability_85pct_5h_unavailable_when_threshold_85() {
+        // 阈值压到 0.85，此时 0.85 utilization 应该被视为撞线 → unavailable
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.85,
+                resets_at: Utc::now() + chrono::Duration::hours(1),
+                status: UnifiedStatus::AllowedWarning,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert!(!judge_availability(&state, 0.85).is_available());
+    }
+
+    #[test]
+    fn availability_90pct_5h_available_when_threshold_97() {
+        // 阈值仍是 0.97，0.90 utilization 还没到，应该 available
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.90,
+                resets_at: Utc::now() + chrono::Duration::hours(1),
+                status: UnifiedStatus::AllowedWarning,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert!(judge_availability(&state, 0.97).is_available());
+    }
+
+    #[test]
+    fn availability_5h_threshold_does_not_affect_7d_check() {
+        // 7d 仍用全局 HIT_THRESHOLD = 0.97。即使 5h 阈值压到 0.85，7d=0.95 仍应 available。
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.30,
+                resets_at: Utc::now() + chrono::Duration::hours(2),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.95,
+                resets_at: Utc::now() + chrono::Duration::days(5),
+                status: UnifiedStatus::AllowedWarning,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        // 5h 阈值压到 0.85 也不影响 7d 仍走 0.97 阈值
+        assert!(judge_availability(&state, 0.85).is_available());
     }
 
     // ---- bottleneck_limit_until ----
@@ -1296,7 +1363,7 @@ mod tests {
         // 允许 2 秒误差（测试机 clock 漂移）
         let diff = (until - expected).num_seconds().abs();
         assert!(diff <= 2, "expected ~60s ban, got diff={}s", diff);
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, HIT_THRESHOLD).is_available());
     }
 
     /// CF-layer 429 但带 retry-after：应用 retry-after 数值，忽略默认 60s。
@@ -1355,7 +1422,7 @@ mod tests {
         assert!(new.rate_limited_until.is_none(), "不应走 fallback 路径");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         // availability 应判 Unavailable（5h 97%）
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, HIT_THRESHOLD).is_available());
     }
 
     /// 200 响应且无 unified-* 头：不应触发任何更新（Phase 2 回归）。
@@ -1373,7 +1440,7 @@ mod tests {
             rate_limited_until: Some(Utc::now() + chrono::Duration::seconds(30)),
             ..Default::default()
         };
-        match judge_availability(&state) {
+        match judge_availability(&state, HIT_THRESHOLD) {
             Availability::Unavailable { until, .. } => assert!(until.is_some()),
             Availability::Available => panic!("应 Unavailable"),
         }
@@ -1386,7 +1453,7 @@ mod tests {
             rate_limited_until: Some(Utc::now() - chrono::Duration::seconds(1)),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, HIT_THRESHOLD).is_available());
     }
 
     // ---- 死锁修复（auto_clear_stale_runtime_flags）----
@@ -1748,7 +1815,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let a = judge_availability(&state);
+        let a = judge_availability(&state, HIT_THRESHOLD);
         assert!(!a.is_available(), "remaining=1/50 应预抢");
         match a {
             Availability::Unavailable { until, reason } => {
@@ -1769,7 +1836,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, HIT_THRESHOLD).is_available());
     }
 
     #[test]
@@ -1783,7 +1850,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        match judge_availability(&state) {
+        match judge_availability(&state, HIT_THRESHOLD) {
             Availability::Unavailable { reason, .. } => assert!(reason.contains("tokens")),
             _ => panic!("should be unavailable"),
         }
@@ -1925,7 +1992,7 @@ mod tests {
         // representative_claim 仍被吸收（UI 要用）
         assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
         // availability 保持 Available（5h util 0.50 远低于 97%，无其它拉黑条件）
-        assert!(judge_availability(&new).is_available());
+        assert!(judge_availability(&new, HIT_THRESHOLD).is_available());
     }
 
     /// 429 + representative-claim=seven_day_opus → 保持既有拉黑行为（Opus 覆盖所有 Opus 请求）。
@@ -1943,7 +2010,7 @@ mod tests {
         let prev = LimitState::default();
         let new = compute_new_state(&prev, 429, &h).expect("should produce state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, HIT_THRESHOLD).is_available());
     }
 
     /// 429 + representative-claim=seven_day（聚合周）→ 保持既有拉黑。
@@ -1960,7 +2027,7 @@ mod tests {
         ]);
         let new = compute_new_state(&LimitState::default(), 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, HIT_THRESHOLD).is_available());
     }
 
     /// 429 + representative-claim=five_hour → 保持既有拉黑。
@@ -1977,7 +2044,7 @@ mod tests {
         ]);
         let new = compute_new_state(&LimitState::default(), 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, HIT_THRESHOLD).is_available());
     }
 
     /// 200 + representative-claim=seven_day_sonnet（正常响应含 Sonnet hint）→ 不触发旁路。

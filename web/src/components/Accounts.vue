@@ -48,6 +48,7 @@ const form = ref({
   priority: 50,
   auto_telemetry: false,
   experimental_reveal_thinking: false,
+  five_hour_threshold: 0.97,
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -125,6 +126,7 @@ function openCreate() {
     priority: 50,
     auto_telemetry: false,
     experimental_reveal_thinking: false,
+    five_hour_threshold: 0.97,
   };
   showForm.value = true;
 }
@@ -152,6 +154,7 @@ function openEdit(a: Account) {
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
     experimental_reveal_thinking: a.experimental_reveal_thinking ?? false,
+    five_hour_threshold: a.five_hour_threshold ?? 0.97,
   };
   showForm.value = true;
 }
@@ -189,6 +192,7 @@ async function save() {
       updates.priority = form.value.priority;
       updates.auto_telemetry = form.value.auto_telemetry;
       updates.experimental_reveal_thinking = form.value.experimental_reveal_thinking;
+      updates.five_hour_threshold = form.value.five_hour_threshold;
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
@@ -533,6 +537,7 @@ function applyOAuthResult() {
     priority: 50,
     auto_telemetry: false,
     experimental_reveal_thinking: false,
+    five_hour_threshold: 0.97,
   };
   showForm.value = true;
 }
@@ -1157,6 +1162,22 @@ async function copyText(text: string) {
                 class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
               />
             </div>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">
+              5 小时利用率阈值（防打满）
+            </Label>
+            <Input
+              v-model.number="form.five_hour_threshold"
+              type="number"
+              min="0.5"
+              max="1.0"
+              step="0.01"
+              class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+            />
+            <p class="text-xs text-[#b5b0a6]">
+              当账号 5h 利用率达到此阈值（[0.5, 1.0]，默认 0.97）时跳过该号。压低留更多余量防 100% 撞 429；7 天窗口仍走全局 0.97。
+            </p>
           </div>
 
           <DialogFooter class="gap-2 pt-2">

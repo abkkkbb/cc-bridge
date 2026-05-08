@@ -150,7 +150,9 @@ impl AccountService {
                         let rate_limit_ok = if skip_rate_limit_filter {
                             self.limit_store.sonnet_available(account_id)
                         } else {
-                            self.limit_store.availability(account_id).is_available()
+                            self.limit_store
+                                .availability(account_id, account.five_hour_threshold)
+                                .is_available()
                         };
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
@@ -190,7 +192,7 @@ impl AccountService {
                     }
                     return true;
                 }
-                let availability = self.limit_store.availability(a.id);
+                let availability = self.limit_store.availability(a.id, a.five_hour_threshold);
                 if !availability.is_available() {
                     limited_out.push(a.id);
                     return false;

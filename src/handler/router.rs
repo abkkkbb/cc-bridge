@@ -239,6 +239,7 @@ async fn create_account(
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
         experimental_reveal_thinking: req.experimental_reveal_thinking.unwrap_or(false),
+        five_hour_threshold: crate::model::account::default_five_hour_threshold(),
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         created_at: chrono::Utc::now(),
@@ -357,6 +358,15 @@ async fn update_account(
         .and_then(|v| v.as_bool())
     {
         existing.experimental_reveal_thinking = reveal;
+    }
+    if let Some(threshold) = updates
+        .get("five_hour_threshold")
+        .and_then(|v| v.as_f64())
+    {
+        // 后端硬挡 [0.5, 1.0]，拒 NaN/inf（codex 要求：UI 可绕过）
+        existing.five_hour_threshold =
+            crate::model::account::validate_five_hour_threshold(threshold)
+                .map_err(|e| AppError::BadRequest(format!("five_hour_threshold: {}", e)))?;
     }
 
     state.account_svc.update_account(&existing).await?;

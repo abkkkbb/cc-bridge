@@ -55,6 +55,8 @@ export interface Account {
   telemetry_count: number
   telemetry_expires_at?: string
   experimental_reveal_thinking?: boolean
+  /** 5h 利用率阈值（防打满）：[0.5, 1.0]，默认 0.97。 */
+  five_hour_threshold?: number
   rate_limited_at?: string
   rate_limit_reset_at?: string
   disable_reason?: string

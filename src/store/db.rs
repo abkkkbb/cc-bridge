@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -97,7 +97,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
     let cols = existing_columns(pool, driver, "accounts").await;
 
-    let pending: [(&str, String); 16] = [
+    let pending: [(&str, String); 17] = [
         (
             "billing_mode",
             "ALTER TABLE accounts ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'strip'".into(),
@@ -162,11 +162,27 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
             "experimental_reveal_thinking",
             "ALTER TABLE accounts ADD COLUMN experimental_reveal_thinking INTEGER NOT NULL DEFAULT 0".into(),
         ),
+        (
+            "five_hour_threshold",
+            "ALTER TABLE accounts ADD COLUMN five_hour_threshold REAL NOT NULL DEFAULT 0.97".into(),
+        ),
     ];
+    // codex review (P0-C #2): 之前用 `.ok()` 静默吞错。如果 ALTER 失败但
+    // schema_migrations 仍被 stamp，下次启动会跳过迁移，SELECT 新列会炸。
+    // 改为 propagate Err，让 boot 显式失败可诊断；列已存在的情况由 cols.contains 提前 continue 避开。
     for (name, sql) in pending.iter() {
-        if !cols.contains(*name) {
-            sqlx::query(sql).execute(pool).await.ok();
+        if cols.contains(*name) {
+            continue;
         }
+        sqlx::query(sql).execute(pool).await.map_err(|e| {
+            tracing::error!(
+                target: "migration",
+                "ALTER TABLE accounts ADD COLUMN {} failed: {}",
+                name,
+                e
+            );
+            e
+        })?;
     }
 
     // Fix column types for existing PG databases that may have TEXT instead of TIMESTAMPTZ/JSONB.
