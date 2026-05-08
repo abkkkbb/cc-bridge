@@ -192,6 +192,7 @@ struct CreateAccountRequest {
     priority: Option<i32>,
     auto_telemetry: Option<bool>,
     experimental_reveal_thinking: Option<bool>,
+    five_hour_threshold: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +211,12 @@ async fn create_account(
     }
     let auth_type = req.auth_type.unwrap_or_else(|| "setup_token".into()).into();
     let setup_token = req.setup_token.or(req.token).unwrap_or_default();
+    // 创建时若传 five_hour_threshold，做 [0.5,1.0] + 拒 NaN/inf 校验；否则默认 0.97。
+    let five_hour_threshold = match req.five_hour_threshold {
+        Some(v) => crate::model::account::validate_five_hour_threshold(v)
+            .map_err(|e| AppError::BadRequest(format!("five_hour_threshold: {}", e)))?,
+        None => crate::model::account::default_five_hour_threshold(),
+    };
     let mut account = Account {
         id: 0,
         name: req.name.unwrap_or_default(),
@@ -239,7 +246,7 @@ async fn create_account(
         auto_telemetry: req.auto_telemetry.unwrap_or(false),
         telemetry_count: 0,
         experimental_reveal_thinking: req.experimental_reveal_thinking.unwrap_or(false),
-        five_hour_threshold: crate::model::account::default_five_hour_threshold(),
+        five_hour_threshold,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         created_at: chrono::Utc::now(),

@@ -217,6 +217,7 @@ async function save() {
         priority: form.value.priority,
         auto_telemetry: form.value.auto_telemetry,
         experimental_reveal_thinking: form.value.experimental_reveal_thinking,
+        five_hour_threshold: form.value.five_hour_threshold,
       };
       if (normalizedExpiresAt) payload.expires_at = normalizedExpiresAt;
       await api.createAccount(payload);
