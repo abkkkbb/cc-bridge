@@ -482,7 +482,25 @@ async fn send_telemetry(
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                debug!("telemetry: {} → {}", url, status);
+                // F10: 同时记录出站 body（debug 级），用于跟真实 CLI HAR 对照分析。
+                // 默认 RUST_LOG=info 不显示，开 `claude_code_gateway::service::telemetry=debug`
+                // 或单独 target `telemetry-out=debug` 才出。
+                let body_json = serde_json::to_string(body).unwrap_or_default();
+                let body_size = body_json.len();
+                let body_log: String = if body_size > 16384 {
+                    let mut end = 16384;
+                    while end > 0 && !body_json.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...[truncated]", &body_json[..end])
+                } else {
+                    body_json
+                };
+                debug!(
+                    target: "telemetry-out",
+                    "ccb→upstream: {} → {} body_size={} body={}",
+                    url, status, body_size, body_log
+                );
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 warn!("telemetry: {} → {} {}", url, status, text);

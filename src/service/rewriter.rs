@@ -309,8 +309,14 @@ impl Rewriter {
             // X-Claude-Code-Session-Id 和 x-client-request-id:
             // v2.1.81 不发送这两个 header，v2.1.109 开始发送。
             // 对齐 DEFAULT_VERSION=2.1.109 行为：保持发送。
-            let session_id =
-                extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid);
+            //
+            // F13: 优先用 extract_rewritten_session_id（从 metadata.user_id JSON / 旧格式提取
+            // 已改写后的 session_id），保证 header 与 body session_id 一致。
+            // 退化到 extract_session_id_from_body（_session_id 内部字段，inject_metadata_user_id
+            // 在创建新 user_id 时才设）。最后回退随机 UUID。
+            let session_id = extract_rewritten_session_id(body_map)
+                .or_else(|| extract_session_id_from_body(body_map))
+                .unwrap_or_else(generate_session_uuid);
             out.insert("X-Claude-Code-Session-Id".into(), session_id);
             out.insert("x-client-request-id".into(), generate_session_uuid());
         } else {
@@ -365,6 +371,20 @@ impl Rewriter {
                         // 强制对齐最新 SDK 版本，防止泄露真实客户端 SDK 信息
                         out.insert(wire_key, "0.81.0".into());
                     }
+                    "x-claude-code-session-id" => {
+                        // F13: 不透传客户端原 session_id（它跟客户端 telemetry 流共享）。
+                        // 用 extract_rewritten_session_id 从已改写 body 取派生值
+                        // （rewrite_body 在 rewrite_headers 之前调用，body_map 已是改写后的）。
+                        // 同时支持 JSON 和旧 user_*_account_*_session_* 两种格式。
+                        let derived = extract_rewritten_session_id(body_map)
+                            .unwrap_or_else(generate_session_uuid);
+                        out.insert(wire_key, derived);
+                    }
+                    "x-client-request-id" => {
+                        // 真实 CLI 每请求生成一个新 UUID（per-request，非 per-session），
+                        // 直接每次新 UUID，不透传客户端原值。
+                        out.insert(wire_key, generate_session_uuid());
+                    }
                     _ => {
                         out.insert(wire_key, v.clone());
                     }
@@ -391,11 +411,17 @@ impl Rewriter {
                 .or_insert_with(|| "600".into());
             out.entry("X-Stainless-Lang".into())
                 .or_insert_with(|| "js".into());
-            out.entry("X-Claude-Code-Session-Id".into()).or_insert_with(|| {
-                extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid)
-            });
-            out.entry("x-client-request-id".into())
-                .or_insert_with(generate_session_uuid);
+            // F13: X-Claude-Code-Session-Id 必须强制覆盖（不是 or_insert_with）。
+            // 客户端没发这个 header 时，or_insert_with 之前会调用 extract_session_id_from_body
+            // 但那个函数只看 metadata._session_id（API 模式内部字段）→ CC 模式下永远 None
+            // → 回退随机 UUID → 跟 body metadata.user_id.session_id 不一致 → 自身就是指纹。
+            // 改成无条件 insert + extract_rewritten_session_id 保证 header == body session_id。
+            out.insert(
+                "X-Claude-Code-Session-Id".into(),
+                extract_rewritten_session_id(body_map).unwrap_or_else(generate_session_uuid),
+            );
+            // F13: x-client-request-id 同样无条件覆盖，每请求新 UUID。
+            out.insert("x-client-request-id".into(), generate_session_uuid());
 
             // 合并客户端 beta 与必需 beta
             // reveal_thinking 开启时,denylist 强制剥离 redact-thinking-2026-02-12,
@@ -541,7 +567,12 @@ impl Rewriter {
         }
     }
 
-    /// 替换已有 metadata.user_id 中的 device_id（CC 客户端模式）。
+    /// 改写已有 metadata.user_id（CC 客户端模式）。
+    ///
+    /// F13: 同时改写 device_id / session_id / account_uuid 三个 identity 字段，
+    /// 使上游收到的 (device, session, account) 三元组完全由 ccb 主导，
+    /// 与客户端 telemetry 流（直发 api.anthropic.com、含客户端原始
+    /// session_id+device_id+email）不再共享任何 JOIN key。
     fn rewrite_metadata_user_id(&self, body: &mut serde_json::Value, account: &Account) {
         let user_id_str = {
             let metadata = match body.get("metadata").and_then(|m| m.as_object()) {
@@ -554,13 +585,35 @@ impl Rewriter {
             }
         };
 
-        // 尝试 JSON 格式
+        // 解 JSON 格式
         if let Ok(mut uid) = serde_json::from_str::<serde_json::Value>(&user_id_str) {
             if let Some(obj) = uid.as_object_mut() {
+                // 提取客户端原始 session_id 作为派生输入。
+                // 真实 CLI 在一次进程内 session_id 稳定 → 多轮对话上游看到同一派生 session_id。
+                let client_session = obj
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let derived_session = derive_session_id(account.id, &client_session);
+
                 obj.insert(
                     "device_id".into(),
                     serde_json::Value::String(account.device_id.clone()),
                 );
+                obj.insert(
+                    "session_id".into(),
+                    serde_json::Value::String(derived_session),
+                );
+                // account_uuid: 始终用 ccb 账号的，不留客户端原值。
+                // ccb 账号没有 OAuth uuid 时写空字符串
+                // —— 不合成假 UUID，因为合成比留空更可疑（Codex review 警告）。
+                let acct_uuid = account.account_uuid.as_deref().unwrap_or("");
+                obj.insert(
+                    "account_uuid".into(),
+                    serde_json::Value::String(acct_uuid.to_string()),
+                );
+
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                     metadata.insert("user_id".into(), serde_json::Value::String(new_str));
@@ -569,13 +622,24 @@ impl Rewriter {
             }
         }
 
-        // 旧格式：user_{device}_account_{uuid}_session_{uuid}
+        // 旧格式：user_{device}_account_{uuid} 或 user_{device}_account_{uuid}_session_{uuid}
+        // F13: 三段都重写，account_uuid 用 ccb 的（空就空），session_id 派生
         if let Some(idx) = user_id_str.find("_account_") {
-            let new_val = format!(
-                "user_{}_account_{}",
-                account.device_id,
-                &user_id_str[idx + 9..]
-            );
+            let after_account = &user_id_str[idx + 9..];
+            let acct_uuid = account.account_uuid.as_deref().unwrap_or("");
+            let new_val = if let Some(session_idx) = after_account.find("_session_") {
+                let session_part = &after_account[session_idx + 9..];
+                // 取下一个 _ 之前的内容当 session_id
+                let client_session = session_part.split('_').next().unwrap_or("").to_string();
+                let derived_session = derive_session_id(account.id, &client_session);
+                format!(
+                    "user_{}_account_{}_session_{}",
+                    account.device_id, acct_uuid, derived_session
+                )
+            } else {
+                // 输入没有 session 段 → 输出也不加（保持结构与输入一致）
+                format!("user_{}_account_{}", account.device_id, acct_uuid)
+            };
             if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                 metadata.insert("user_id".into(), serde_json::Value::String(new_val));
             }
@@ -1347,6 +1411,74 @@ pub fn generate_session_uuid() -> String {
     rand::thread_rng().fill(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex::encode(&b[0..4]),
+        hex::encode(&b[4..6]),
+        hex::encode(&b[6..8]),
+        hex::encode(&b[8..10]),
+        hex::encode(&b[10..16])
+    )
+}
+
+/// F13 helper: 从已改写后的 body 提取 metadata.user_id.session_id。
+///
+/// 同时支持新 JSON 格式（`{"device_id":..., "session_id":..., "account_uuid":...}`）
+/// 和旧格式（`user_<device>_account_<uuid>_session_<uuid>`）。
+///
+/// 用途：CC 模式 header 处理 / post-loop fallback 都靠这个保证 X-Claude-Code-Session-Id
+/// header 与 body metadata.user_id.session_id 完全一致（否则 header/body 不匹配本身是指纹）。
+pub fn extract_rewritten_session_id(body_map: &serde_json::Value) -> Option<String> {
+    let user_id_str = body_map
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|s| s.as_str())?;
+    // JSON 格式
+    if let Ok(uid) = serde_json::from_str::<serde_json::Value>(user_id_str) {
+        if let Some(sid) = uid.get("session_id").and_then(|s| s.as_str()) {
+            if !sid.is_empty() {
+                return Some(sid.to_string());
+            }
+        }
+    }
+    // 旧格式: ...._session_<uuid>
+    if let Some(idx) = user_id_str.find("_session_") {
+        let session_part = &user_id_str[idx + 9..];
+        let session_id = session_part.split('_').next().unwrap_or("");
+        if !session_id.is_empty() {
+            return Some(session_id.to_string());
+        }
+    }
+    None
+}
+
+/// F13: 派生稳定 session UUID，断绝跨流 JOIN。
+///
+/// 输入：账号 id + 客户端原始 session_hash（来自 metadata.user_id.session_id）
+/// 输出：标准 RFC 4122 v4 UUID 字符串。
+///
+/// 关键性质：
+///   - 非空 client_session_hash：同 (account_id, client_session_hash) **永远**得到同一结果
+///     （多轮对话 session 稳定，与真实 CLI 单进程内 session_id 一致的行为吻合）
+///   - 空 client_session_hash：回退随机 UUID（避免同账号下多个无 session 请求映射到同一派生值）
+///   - 不同账号 / 不同客户端 session 之间互不冲突
+///   - 客户端 telemetry 流（绕过 ccb 直发 api.anthropic.com）发出的原 session_id 与
+///     此处算出值永远不相等，Anthropic 后台无法跨流 JOIN
+///   - 输出格式严格 RFC 4122 v4（version=4, variant=10），wire 上跟 CLI 的
+///     `crypto.randomUUID()` 输出无法区分
+///
+/// 改 SALT 即可让所有历史关联失效（紧急熔断）。
+pub fn derive_session_id(account_id: i64, client_session_hash: &str) -> String {
+    if client_session_hash.is_empty() {
+        // 无客户端 session 信息 → 回退随机 UUID，避免一账号下多请求映射到同一派生值
+        return generate_session_uuid();
+    }
+    const SALT: &str = "ccb-session-rewrite-v1";
+    let seed = format!("{}::{}::{}", account_id, client_session_hash, SALT);
+    let hash = Sha256::digest(seed.as_bytes());
+    let mut b: [u8; 16] = hash[0..16].try_into().expect("sha256 head 16 bytes");
+    b[6] = (b[6] & 0x0f) | 0x40; // RFC 4122 version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
     format!(
         "{}-{}-{}-{}-{}",
         hex::encode(&b[0..4]),

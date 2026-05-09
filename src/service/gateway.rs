@@ -165,7 +165,11 @@ impl GatewayService {
             .unwrap_or_default();
 
         // 读取请求体
-        let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+        // 请求 body 上限 30 MB。
+        // 旧值 10 MB 过于保守，Anthropic 上游能吃下更大的（参考 sub2api 默认 256 MB）。
+        // 30 MB 折中：覆盖大文件附件 + 长上下文场景，又不会让单个大请求把 ccb 内存压满
+        // （注意：to_bytes 是全 buffer 读取，不是流式）。
+        let body_bytes = axum::body::to_bytes(req.into_body(), 30 * 1024 * 1024)
             .await
             .map_err(|e| AppError::BadRequest(format!("failed to read body: {}", e)))?;
         cp!("body_read");
